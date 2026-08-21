@@ -1,0 +1,103 @@
+package render
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// The incident this package exists to prevent: three of four secrets resolved, and the render went
+// ahead. The file looked complete, the container started healthy, and the missing credential was
+// only noticed weeks later when it was needed.
+func TestDotenv_RefusesAPartialSet(t *testing.T) {
+	_, err := Dotenv(map[string]string{"A": "1", "B": "2"}, []string{"A", "B", "C"})
+	if err == nil {
+		t.Fatal("rendering with a missing key must fail, not produce a partial file")
+	}
+	if !strings.Contains(err.Error(), "C") {
+		t.Errorf("the error must name what is missing, got: %v", err)
+	}
+}
+
+// An empty value is what a blank interpolation produces — the exact shape of the traefik failure,
+// where ${A}.${B} became ".". Treating it as present would reproduce the bug faithfully.
+func TestDotenv_TreatsEmptyAsMissing(t *testing.T) {
+	_, err := Dotenv(map[string]string{"A": "1", "B": "   "}, []string{"A", "B"})
+	var inc *ErrIncomplete
+	if err == nil {
+		t.Fatal("an empty secret must not be rendered")
+	}
+	if !strings.Contains(err.Error(), "empty") {
+		t.Errorf("want an 'empty' complaint, got: %v", err)
+	}
+	_ = inc
+}
+
+// Stable output is what makes hashing meaningful: unstable ordering would make every poll look like
+// a change, and every change triggers a restart.
+func TestDotenv_IsDeterministic(t *testing.T) {
+	vals := map[string]string{"B": "2", "A": "1", "C": "3"}
+	keys := []string{"C", "A", "B"}
+	first, err := Dotenv(vals, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		again, err := Dotenv(vals, []string{"A", "B", "C"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if Hash(first) != Hash(again) {
+			t.Fatal("same secrets rendered to different bytes; hashes would be useless")
+		}
+	}
+}
+
+func TestQuote(t *testing.T) {
+	cases := map[string]string{
+		"simple":            "simple",
+		"has space":         `"has space"`,
+		`has"quote`:         `"has\"quote"`,
+		`with$dollar`:       `"with$dollar"`,
+		"tricky\\backslash": `"tricky\\backslash"`,
+	}
+	for in, want := range cases {
+		if got := quote(in); got != want {
+			t.Errorf("quote(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestWrite_AtomicAndOnlyWhenChanged(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sub", ".env")
+
+	changed, err := Write(path, []byte("A=1\n"), 0o600)
+	if err != nil || !changed {
+		t.Fatalf("first write: changed=%v err=%v", changed, err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("secrets file mode is %v, want 0600", fi.Mode().Perm())
+	}
+
+	// Identical content must not count as a change, or every poll would restart the service.
+	if changed, err := Write(path, []byte("A=1\n"), 0o600); err != nil || changed {
+		t.Errorf("rewriting identical content reported changed=%v err=%v", changed, err)
+	}
+	if changed, err := Write(path, []byte("A=2\n"), 0o600); err != nil || !changed {
+		t.Errorf("new content should report a change, got changed=%v err=%v", changed, err)
+	}
+
+	// No temporary files left behind: they would hold secrets at a predictable path.
+	entries, _ := os.ReadDir(filepath.Dir(path))
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".anchor-") {
+			t.Errorf("left a temporary file behind: %s", e.Name())
+		}
+	}
+}
