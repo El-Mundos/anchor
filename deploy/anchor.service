@@ -6,6 +6,16 @@ Documentation=https://github.com/El-Mundos/anchor
 Wants=docker.service
 After=docker.service network-online.target
 
+# anchor is not a boot dependency for anything. If it cannot start, stacks keep running on their
+# last-good files — so restart forever rather than escalating to a failed state, which would stop
+# systemd retrying and turn a transient problem into a permanent one.
+#
+# This key belongs in [Unit], NOT [Service]. systemd parses it happily in [Service] and then ignores
+# it with only a log line, so the unit looks correct and the limit silently stays at its default of
+# 5 starts in 10s. Caught on the first real `systemctl enable`:
+#   anchor.service:21: Unknown key 'StartLimitIntervalSec' in section [Service], ignoring.
+StartLimitIntervalSec=0
+
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/anchor run
@@ -15,10 +25,6 @@ User=root
 
 Restart=always
 RestartSec=10s
-
-# anchor is not a boot dependency for anything. If it cannot start, stacks keep running on their
-# last-good files — so restart forever and stay quiet rather than escalating.
-StartLimitIntervalSec=0
 
 # Hardening. Deliberately NOT ProtectSystem=strict: anchor's entire job is writing into stack
 # directories under /srv, and a sandbox that forbids that would make it fail in a way that looks
