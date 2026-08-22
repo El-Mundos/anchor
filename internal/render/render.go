@@ -15,9 +15,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -100,6 +100,160 @@ func complete(values map[string]string, keys []string) error {
 	return nil
 }
 
+// keyLine matches a KEY= assignment. Anything that does not match — comments, blank lines,
+// continuations, whatever somebody put there — is not ours to interpret and is preserved verbatim.
+var keyLine = regexp.MustCompile(`^[ \t]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*=`)
+
+// Parse extracts KEY=value pairs, applying dotenv's last-one-wins rule.
+//
+// Last wins because that is what compose does when a file declares a key twice. Reading it any other
+// way would make anchor's idea of the current value differ from the one the container actually gets.
+func Parse(content []byte) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(string(content), "\n") {
+		m := keyLine.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		_, v, _ := strings.Cut(line, "=")
+		out[m[1]] = unquote(strings.TrimSpace(v))
+	}
+	return out
+}
+
+// unquote reverses quote for the values anchor itself wrote, and does something sane with the rest.
+func unquote(v string) string {
+	if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
+		r := strings.NewReplacer(`\n`, "\n", `\"`, `"`, `\\`, `\`)
+		return r.Replace(v[1 : len(v)-1])
+	}
+	return v
+}
+
+// Merge produces the new file contents: anchor's declared keys set to their current values, and
+// every other line left exactly as it was.
+//
+// This is the whole relationship between anchor and a file it does not own. A stack being migrated
+// usually already has a .env holding more than secrets — ports, hostnames, feature flags, a
+// timezone. Rendering only the declared keys over the top of that would delete the rest, and compose
+// interpolates a missing variable to an empty string rather than failing, so the container comes up
+// healthy with a blank value in it. Editing in place instead means anchor never has to be told what
+// it is allowed to touch: the manifest already says, and everything else is somebody else's.
+//
+// Existing keys are updated where they stand, so the file keeps whatever order and grouping its
+// author gave it. New ones are appended, sorted, so identical inputs always produce identical bytes.
+func Merge(existing []byte, values map[string]string, names []string) ([]byte, error) {
+	if err := complete(values, names); err != nil {
+		return nil, err
+	}
+	if len(existing) == 0 {
+		return Dotenv(values, names)
+	}
+
+	managed := map[string]bool{}
+	for _, n := range names {
+		managed[n] = true
+	}
+
+	// Which occurrence of each managed key is the one that counts. Compose takes the last, so that
+	// is the one rewritten; earlier duplicates are dropped. Updating the first and leaving a stale
+	// second would leave the container reading the old value while the file looked correct.
+	lines := strings.Split(string(existing), "\n")
+	last := map[string]int{}
+	for i, line := range lines {
+		if m := keyLine.FindStringSubmatch(line); m != nil && managed[m[1]] {
+			last[m[1]] = i
+		}
+	}
+
+	var b strings.Builder
+	for i, line := range lines {
+		m := keyLine.FindStringSubmatch(line)
+		if m != nil && managed[m[1]] {
+			if last[m[1]] != i {
+				continue // an earlier duplicate of a key we manage
+			}
+			b.WriteString(m[1] + "=" + quote(values[m[1]]))
+			if i < len(lines)-1 {
+				b.WriteString("\n")
+			}
+			continue
+		}
+		b.WriteString(line)
+		if i < len(lines)-1 {
+			b.WriteString("\n")
+		}
+	}
+
+	out := b.String()
+	var missing []string
+	for _, n := range names {
+		if _, seen := last[n]; !seen {
+			missing = append(missing, n)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		if !strings.HasSuffix(out, "\n") {
+			out += "\n"
+		}
+		for _, n := range missing {
+			out += n + "=" + quote(values[n]) + "\n"
+		}
+	}
+	return []byte(out), nil
+}
+
+// RemoveKeys deletes exactly the named keys from path, leaving every other line untouched.
+//
+// This is the revocation path. It used to delete the whole file, which is wrong for the same reason
+// blind overwriting was: the file may carry configuration anchor never supplied and has no business
+// destroying. Removing only the declared keys still achieves what a revocation is for — the compose
+// ${VAR:?} guards abort, so the stack will not start on disowned credentials.
+//
+// If nothing that looks like configuration survives, the file goes too, rather than leaving a stub
+// of anchor's own header behind.
+func RemoveKeys(path string, names []string) (removed bool, err error) {
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil // already gone; a purge that repeats is not a failure
+		}
+		return false, fmt.Errorf("purge %s: %w", path, err)
+	}
+	managed := map[string]bool{}
+	for _, n := range names {
+		managed[n] = true
+	}
+
+	var kept []string
+	dropped, survivors := false, false
+	for _, line := range strings.Split(string(existing), "\n") {
+		if m := keyLine.FindStringSubmatch(line); m != nil {
+			if managed[m[1]] {
+				dropped = true
+				continue
+			}
+			survivors = true
+		}
+		kept = append(kept, line)
+	}
+	if !dropped {
+		return false, nil
+	}
+	if !survivors {
+		// Only comments and blank lines would remain. Leave nothing behind.
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return false, fmt.Errorf("purge %s: %w", path, err)
+		}
+		return true, nil
+	}
+	if _, err := Write(path, []byte(strings.Join(kept, "\n")), 0o600); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Hash fingerprints rendered content. Comparisons are made on this, never on file timestamps: two
 // clocks disagree, mtime survives a restore-from-backup that replaces the content, and a touched
 // file looks fresh while holding yesterday's secrets.
@@ -132,33 +286,6 @@ func Purge(path string) (removed bool, err error) {
 		return false, fmt.Errorf("purge %s: %w", path, err)
 	}
 	return true, nil
-}
-
-// Foreign reports whether path exists and was NOT written by anchor.
-//
-// The case this exists for: a stack being migrated usually already HAS a .env, and it commonly
-// holds more than secrets — ports, hostnames, feature flags, a TZ. anchor renders only what the
-// manifest declares, so overwriting such a file silently deletes everything undeclared. Compose then
-// interpolates those to empty strings and the container starts perfectly healthy with a blank
-// value in it, which is the exact incident anchor was built to prevent. Reproducing it during a
-// migration TO anchor would be a poor joke.
-//
-// A missing file is not foreign — that is the normal first render.
-func Foreign(path string) (bool, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	defer f.Close()
-	buf := make([]byte, len(Header))
-	n, err := io.ReadFull(f, buf)
-	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-		return false, err
-	}
-	return string(buf[:n]) != Header, nil
 }
 
 // Write atomically replaces path with content, owner-readable only. It reports whether the content

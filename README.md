@@ -76,19 +76,28 @@ services:
     on_revoke: stop      # stop (default) | leave — what to do if the identity is revoked
 ```
 
-### Migrating a stack that already has a `.env`
+### A stack that already has a `.env`
 
-anchor refuses to overwrite a destination it did not write. Almost every stack being migrated
-already has a `.env`, and it usually holds more than secrets — ports, hostnames, feature flags, a
-timezone. anchor renders only what the manifest declares, so replacing such a file would delete
-everything undeclared, and compose turns the missing variables into empty strings rather than an
-error: the container starts healthy with a blank value in it. That is the incident anchor exists to
-prevent, and reproducing it during a migration *to* anchor would be a poor joke.
+anchor edits its own keys and leaves everything else alone. The manifest already says which keys are
+anchor's, so it never needs to be told what it may touch — every other line in the file belongs to
+somebody else and is preserved exactly.
 
-So the first render against an existing file fails, loudly, naming the file. Open it, move any
-non-secret variables into the compose file or declare them, then either move the old file aside or
-set `adopt: true` in the manifest. The point of the flag is not permission, it is that somebody
-looked.
+This matters because a stack being migrated usually already has a `.env` holding more than secrets:
+ports, hostnames, feature flags, a timezone. Rendering only the declared keys over the top of that
+would delete the rest, and compose interpolates a missing variable to an **empty string** rather than
+failing — so the container comes up healthy with a blank value in it. That is the incident anchor
+exists to prevent, and reproducing it during a migration *to* anchor would be a poor joke.
+
+Existing keys are updated where they stand, so the file keeps whatever order and grouping its author
+gave it; newly declared ones are appended, sorted. Where a key is assigned twice, anchor rewrites the
+**last** one and drops the earlier duplicates, because the last is the one compose uses.
+
+Revocation follows the same rule: it deletes anchor's declared keys and nothing else. The stack still
+refuses to start, because the `${VAR:?}` guards abort — which is the point — but configuration anchor
+never supplied is not anchor's to destroy. If nothing but comments would remain, the file goes too.
+
+An edit to a variable anchor does not manage will not recreate anything. "The file changed" and
+"anchor's values changed" are separate questions, and only the second authorises an action.
 
 `on_revoke` is a separate question from `on_change` because a revoked secret is not a changed one:
 the right outcome may be an outage. A revocation purges the rendered file and, by default, stops the

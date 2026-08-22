@@ -120,9 +120,6 @@ const (
 	// clearing. The store considers the key current, so every later poll reports no change; the
 	// condition ends when a human performs the coordinated rotation, which is invisible from here.
 	heldSharedState reason = "shared-state"
-	// heldForeign: the destination exists and anchor did not write it. Cleared only by an operator
-	// dealing with the file, which anchor cannot observe beyond the file itself changing.
-	heldForeign reason = "foreign-destination"
 	// heldDrift: a service declares on_change: none, so the file is ahead of the process. Also
 	// invisible to anchor, since it never recreates that service and so never learns it caught up.
 	heldDrift reason = "drift"
@@ -206,8 +203,17 @@ func (r *Reconciler) Once(ctx context.Context, p Pass) (Outcome, error) {
 		return r.fault(ctx, p, err)
 	}
 
-	// 3. Render and compare bytes.
-	content, err := render.Dotenv(m.Rename(values), m.Names())
+	// 3. Merge into whatever is already on disk, and compare.
+	//
+	// Read first, because anchor edits its own keys rather than owning the file. A read error other
+	// than "not there" is treated as an empty file only after being surfaced — silently starting
+	// from scratch would delete the very lines this exists to keep.
+	existing, readErr := os.ReadFile(m.Destination)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return OutcomeHeld, fmt.Errorf("reading %s: %w", m.Destination, readErr)
+	}
+	wanted := m.Rename(values)
+	content, err := render.Merge(existing, wanted, m.Names())
 	if err != nil {
 		// Incomplete: all-or-nothing refuses, and the previous file stands. This is a hold rather
 		// than a failure precisely because the old file is still serving.
@@ -221,29 +227,27 @@ func (r *Reconciler) Once(ctx context.Context, p Pass) (Outcome, error) {
 		return OutcomeHeld, err
 	}
 
-	// Refuse to destroy a file anchor did not write, unless the manifest says to adopt it.
-	foreign, err := render.Foreign(m.Destination)
-	if err != nil {
-		return OutcomeHeld, err
-	}
-	if foreign && !m.Adopt {
-		err := fmt.Errorf("%s already exists and was not written by anchor; it may hold variables "+
-			"this manifest does not declare, which would be silently deleted. Check it, then either "+
-			"move it aside or set `adopt: true`", m.Destination)
-		r.hold(ctx, heldForeign, Alert{Stack: stack, Severity: "critical",
-			Summary: "refusing to overwrite a file anchor did not write",
-			Detail:  err.Error()})
-		return OutcomeHeld, err
+	// Whether OUR keys moved, decided before the write and independently of the file as a whole.
+	//
+	// These are two different questions and were previously one. The file can change without any
+	// managed value changing — somebody edits PORT, or a first merge tidies formatting — and acting
+	// on that would recreate a container because of an edit anchor had nothing to do with.
+	previous := render.Parse(existing)
+	managedChanged := false
+	for _, n := range m.Names() {
+		if old, had := previous[n]; !had || old != wanted[n] {
+			managedChanged = true
+			break
+		}
 	}
 
-	changed, err := render.Write(m.Destination, content, 0o600)
-	if err != nil {
+	if _, err := render.Write(m.Destination, content, 0o600); err != nil {
 		return OutcomeHeld, err
 	}
-	if !changed {
-		// The store moved but the bytes did not — a republished secret with an unchanged value.
+	if !managedChanged {
+		// The store moved but our values did not — a republished secret with an unchanged value.
 		// Acting here would restart a healthy container for nothing.
-		r.Log.Debug("versions moved but rendered content is identical", "stack", stack)
+		r.Log.Debug("versions moved but the managed values are identical", "stack", stack)
 		return OutcomeUnchanged, nil
 	}
 	// A render got all the way through, which is the one held condition anchor can prove is over.
@@ -417,17 +421,18 @@ func (r *Reconciler) revoked(ctx context.Context, p Pass, se *store.Error) (Outc
 	m := r.Manifest
 	stack := m.Stack()
 
-	r.Log.Error("identity revoked; purging rendered secrets", "stack", stack, "err", se)
+	r.Log.Error("identity revoked; removing this stack's secrets", "stack", stack, "err", se)
 	r.alert(ctx, Alert{Stack: stack, Severity: "critical",
-		Summary: "identity revoked — secrets purged and services stopping",
-		Detail: fmt.Sprintf("%s. The rendered file has been removed, so this stack will NOT start "+
-			"until a working identity is restored.", se)})
+		Summary: "identity revoked — secrets removed and services stopping",
+		Detail: fmt.Sprintf("%s. This stack's declared keys have been deleted from %s, so it will "+
+			"NOT start until a working identity is restored. Any other variables in that file were "+
+			"left alone.", se, m.Destination)})
 
-	removed, err := render.Purge(m.Destination)
+	removed, err := render.RemoveKeys(m.Destination, m.Names())
 	if err != nil {
 		return OutcomeHeld, err
 	}
-	r.Log.Info("purge complete", "stack", stack, "file-removed", removed)
+	r.Log.Info("purge complete", "stack", stack, "keys-removed", removed)
 
 	if p.NoAct {
 		// `anchor render` must not stop containers, on this path least of all. Reaching a revocation

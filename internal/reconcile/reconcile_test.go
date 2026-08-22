@@ -613,50 +613,80 @@ func TestOnce_ARejectedIdentityTouchesNothing(t *testing.T) {
 	}
 }
 
-// The end-to-end version of the same incident: a stack with an existing .env must not be silently
-// flattened to only the declared keys.
-func TestOnce_RefusesToOverwriteAFileAnchorDidNotWrite(t *testing.T) {
-	r, _, actor, alerter := setup(t, manifestBody)
-	existing := "PORT=8080\nTZ=Europe/Madrid\nSESSION_SECRET=old\n"
+// End-to-end version: a stack with an existing hand-maintained .env keeps everything anchor does not
+// declare, in both directions — on render, and on revocation.
+func TestOnce_MergesIntoAnExistingFileRatherThanReplacingIt(t *testing.T) {
+	r, fs, _, _ := setup(t, manifestBody)
+	existing := "# hand written\nPORT=8080\nTZ=Europe/Madrid\n"
 	if err := os.WriteFile(r.Manifest.Destination, []byte(existing), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	out, err := r.Once(context.Background(), Pass{Force: true, NoAct: true})
-	if err == nil {
-		t.Fatal("expected a refusal")
+	if _, err := r.Once(context.Background(), Pass{Force: true, NoAct: true}); err != nil {
+		t.Fatal(err)
 	}
-	if out != OutcomeHeld {
-		t.Errorf("outcome = %q, want held", out)
+	b, err := os.ReadFile(r.Manifest.Destination)
+	if err != nil {
+		t.Fatal(err)
 	}
-	b, readErr := os.ReadFile(r.Manifest.Destination)
-	if readErr != nil || string(b) != existing {
-		t.Errorf("the pre-existing file was modified; PORT and TZ would have been silently deleted "+
-			"and compose would interpolate them to empty strings.\ngot: %q", string(b))
+	s := string(b)
+	for _, keep := range []string{"# hand written", "PORT=8080", "TZ=Europe/Madrid"} {
+		if !contains(s, keep) {
+			t.Errorf("render destroyed %q; compose would interpolate it to an empty string:\n%s",
+				keep, s)
+		}
 	}
-	if len(actor.recreated) != 0 {
-		t.Errorf("acted on services despite refusing to render: %v", actor.recreated)
+	if !contains(s, "SESSION_SECRET=s3cret") {
+		t.Errorf("the declared secret was not written:\n%s", s)
 	}
-	if !alerter.sawSummary("did not write") {
-		t.Error("a refusal to adopt must be alerted, not just returned as an error")
+
+	// Now revoke. Only anchor's keys go.
+	fs.FailWith = &store.Error{Fault: store.FaultIdentityRevoked, Op: "login", Status: 401}
+	if _, err := r.Once(context.Background(), Pass{NoAct: true}); err != nil {
+		t.Fatal(err)
+	}
+	b, err = os.ReadFile(r.Manifest.Destination)
+	if err != nil {
+		t.Fatalf("revocation deleted the whole file, taking PORT and TZ with it: %v", err)
+	}
+	s = string(b)
+	if contains(s, "SESSION_SECRET") {
+		t.Errorf("the revoked secret survived:\n%s", s)
+	}
+	if !contains(s, "PORT=8080") || !contains(s, "TZ=Europe/Madrid") {
+		t.Errorf("revocation destroyed configuration anchor never supplied:\n%s", s)
 	}
 }
 
-// With adopt set, the operator has said they looked. anchor proceeds.
-func TestOnce_AdoptTakesOverAnExistingFile(t *testing.T) {
-	r, _, _, _ := setup(t, manifestBody+"adopt: true\n")
-	if err := os.WriteFile(r.Manifest.Destination, []byte("PORT=8080\n"), 0o600); err != nil {
+// An edit to a variable anchor does not manage must not recreate a container. The file changing and
+// anchor's values changing are two different questions.
+func TestOnce_AnUnmanagedEditDoesNotRecreateAnything(t *testing.T) {
+	r, fs, actor, _ := setup(t, manifestBody)
+	ctx := context.Background()
+	if _, err := r.Once(ctx, Pass{Force: true, NoAct: true}); err != nil {
 		t.Fatal(err)
 	}
-	out, err := r.Once(context.Background(), Pass{Force: true, NoAct: true})
-	if err != nil {
-		t.Fatalf("adopt: true must permit the render: %v", err)
-	}
-	if out != OutcomeRendered {
-		t.Errorf("outcome = %q, want rendered", out)
-	}
+
+	// Somebody edits an unrelated variable, and a secret is republished with the same value.
 	b, _ := os.ReadFile(r.Manifest.Destination)
-	if !contains(string(b), "SESSION_SECRET") {
-		t.Error("the file was not replaced with anchor's render")
+	if err := os.WriteFile(r.Manifest.Destination, append(b, []byte("PORT=9090\n")...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fs.Metas["NS_SESSION_SECRET"] = store.Meta{Version: 9, UpdatedAt: time.Unix(9000, 0)}
+
+	out, err := r.Once(ctx, Pass{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actor.recreated) != 0 {
+		t.Errorf("recreated %v because of an edit to a variable anchor does not manage",
+			actor.recreated)
+	}
+	if out != OutcomeUnchanged {
+		t.Errorf("outcome = %q, want unchanged", out)
+	}
+	s, _ := os.ReadFile(r.Manifest.Destination)
+	if !contains(string(s), "PORT=9090") {
+		t.Error("the unmanaged edit was reverted")
 	}
 }
