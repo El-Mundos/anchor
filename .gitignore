@@ -2,5 +2,9 @@
 # name at any depth — which silently excluded cmd/anchor/, and with it the entire CLI.
 /anchor
 /deploy/anchor
+
+# Filled-in deployment config: a real manifest names the Infisical project, the host paths and
+# every secret a stack uses. The examples beside it are what belongs in the repo.
+/deploy/local/
 *.tmp
 .anchor-*

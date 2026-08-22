@@ -1,0 +1,31 @@
+# anchor's own configuration. Installs to /etc/anchor/config.yml.
+#
+# Only host-wide settings live here. Anything a stack owns — its keys, its identity, what happens
+# when they change — belongs in that stack's anchor.yml, beside its compose file.
+#
+# Copy to deploy/local/config.yml and fill in. deploy/local/ is not tracked.
+
+# Use an INTERNAL address. A public Infisical hostname usually sits behind some form of
+# forward-auth, which would intercept machine-identity API calls — and routing secrets through the
+# edge proxy puts that proxy on the path of the credentials it needs in order to start.
+infisical_url: http://localhost:8080
+
+# Searched exactly one level down: <root>/<stack>/anchor.yml. Not a recursive walk, which would
+# eventually find a manifest in a backup directory and render secrets somewhere nobody remembers.
+stack_roots:
+  - /srv/infra
+
+poll_interval: 60s
+
+# Optional. Empty means alerts are logged only, which is a legitimate way to start — a controller
+# that cannot alert is still better than one that also cannot render.
+#
+# This must be an address the HOST can reach. anchor runs on the host, not in the compose network,
+# so a Docker-internal name like alertmanager:9093 will not resolve. Use the published port.
+#
+# Karma is only a UI over Alertmanager's API, so posting here is enough to make alerts appear there.
+alertmanager_url: ""
+
+# Not yet functional: Belay exposes no machine API for a health-gated recreate. Setting this only
+# produces a warning at startup. Left here so the intent is visible rather than forgotten.
+belay_url: ""

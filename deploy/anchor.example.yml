@@ -1,0 +1,47 @@
+# A stack's manifest. Installs to <stack_root>/<stack>/anchor.yml, beside its compose file.
+#
+# Copy to deploy/local/<stack>.anchor.yml and fill in. deploy/local/ is not tracked, because a
+# filled-in manifest names your project, your paths and every secret your stack uses.
+
+project: 00000000-0000-0000-0000-000000000000 # Infisical project id
+env: prod
+path: /
+
+# The machine identity this stack authenticates with. Per-stack on purpose: a leaked identity should
+# expose one stack's secrets, not the fleet's.
+#
+# It lives in the stack directory so a stack's configuration travels with the stack, and it must be
+# 0600 root:root — that is the only thing keeping the credential out of reach of anything else that
+# can write into that directory.
+identity_file: /srv/infra/example/anchor-identity.json
+
+render: env
+destination: /srv/infra/example/.env
+
+secrets:
+  # `as:` renames a key on the way to the file. A store is shared and a compose file is not, so
+  # secrets are usually namespaced per stack while compose wants the bare name. Without this the two
+  # have to be kept identical, and the usual result is a hand-maintained translation step — which is
+  # the deploy wrapper anchor exists to delete.
+  - key: EXAMPLE_SESSION_SECRET
+    as: SESSION_SECRET
+
+  - key: EXAMPLE_OIDC_CLIENT_SECRET
+    as: OIDC_CLIENT_SECRET
+
+  # shared_state marks a secret that is a COPY of state living in another system. A database only
+  # reads its password at initialisation, so rotating it in the store does not rotate it in the
+  # database — and applying it would point the app at a password the database has never heard of.
+  # These are rendered, so the file stays a complete record, and never acted on.
+  - key: EXAMPLE_POSTGRES_PASSWORD
+    as: POSTGRES_PASSWORD
+    shared_state: true
+
+services:
+  # A service listed here is one anchor may TOUCH, not one that reads a secret. A database that
+  # consumes only shared state is deliberately left out.
+  - name: api
+    on_change: recreate # none | reload (needs signal) | recreate — env vars are baked in at
+                        # creation, so only a recreate applies a new value
+    on_revoke: stop     # stop | leave — a running container keeps the environment it was created
+                        # with, so until it stops, a revoked secret is still in use

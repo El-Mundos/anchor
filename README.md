@@ -98,6 +98,49 @@ anchor run              reconcile continuously
 without one. It deliberately does not act on containers: rendering a file is safe on a running host,
 and nobody should get a restart from a command called "render".
 
+## Installing
+
+`deploy/` holds everything needed to put anchor on a host. Nothing in it starts or restarts a
+service: it renders the file a stack needs in order to boot, and stops there.
+
+```
+deploy/
+  anchor.service        systemd unit for the daemon
+  config.example.yml    host-wide settings -> /etc/anchor/config.yml
+  anchor.example.yml    a worked stack manifest -> <root>/<stack>/anchor.yml
+  install.sh            ./install.sh <stack> [stack-root], run as root on the host
+  local/                your filled-in copies. NOT tracked.
+```
+
+The split exists because the two halves have different audiences. The examples are documentation
+and belong in the repo; a filled-in manifest names your Infisical project, your host paths and every
+secret a stack uses, so it stays out.
+
+```sh
+go build -o deploy/anchor ./cmd/anchor
+mkdir -p deploy/local
+cp deploy/config.example.yml  deploy/local/config.yml
+cp deploy/anchor.example.yml  deploy/local/<stack>.anchor.yml
+# edit both, copy deploy/ to the host, then:
+sudo ./install.sh <stack>
+```
+
+### The one thing install.sh cannot do for you
+
+Each stack authenticates with its own Infisical **machine identity**, and the client secret can only
+be minted by a human. In Infisical: **Access Control -> Identities -> _your stack_ -> Universal Auth
+-> Create Client Secret**. Use the identity that already exists rather than making a new one, or it
+will not carry the project permissions the old one has.
+
+That gives you two values, which go in a JSON file at the `identity_file` path from the manifest:
+
+```json
+{"client_id": "...", "client_secret": "..."}
+```
+
+It must be `0600 root:root`. anchor refuses to start if either field is empty, rather than
+discovering it at the first poll.
+
 ## Status
 
 Working end to end, not yet deployed. Manifest, rendering, the Infisical client (with API version
