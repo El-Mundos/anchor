@@ -53,6 +53,19 @@ const (
 	// identity is put back. An outage is the correct outcome of a deliberate revocation.
 	FaultIdentityRevoked
 
+	// FaultIdentityRejected — the store refused an identity that has NEVER worked in this process.
+	//
+	// Separate from a revocation because the two look identical on the wire and demand opposite
+	// responses. A revocation means credentials that were valid are now refused, and the right
+	// answer is to purge and stop. This means credentials that were never accepted at all — a
+	// typo'd client id, a secret pasted from the wrong identity, a file filled in against the wrong
+	// project — and the right answer is to touch nothing and say so.
+	//
+	// The rule that separates them: you cannot be revoked from something you were never granted.
+	// Treating a first-contact 401 as a revocation would let a misconfigured install purge a working
+	// stack's secrets and stop its containers, which is a self-inflicted outage caused by a typo.
+	FaultIdentityRejected
+
 	// FaultSecretMissing — our identity is fine; a declared key is not there. Deliberately NOT the
 	// same as a revocation. A key vanishing is far more often a rename, a moved folder or a typo'd
 	// path than a disownment, and treating a typo as a revocation would take a stack down for a

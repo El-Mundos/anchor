@@ -544,3 +544,71 @@ func TestOnce_ASuccessfulRenderReleasesTheIncompleteHold(t *testing.T) {
 			r.Held())
 	}
 }
+
+// The incident this prevents, which actually happened on the first real install (2026-08-22):
+// `anchor render` attempted to stop a production container.
+//
+// The identity file had the wrong client id, Infisical answered 401, anchor read that as a
+// revocation and went down the purge-and-stop path — which never consulted NoAct at all. The stop
+// only failed because the stack could not be interpolated without the very file anchor had not yet
+// written. Nothing was harmed by design; it was luck.
+func TestOnce_RenderNeverStopsContainersEvenOnRevocation(t *testing.T) {
+	r, fs, actor, _ := setup(t, manifestBody)
+	fs.FailWith = &store.Error{Fault: store.FaultIdentityRevoked, Op: "login", Status: 401}
+
+	out, err := r.Once(context.Background(), Pass{Force: true, NoAct: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out != OutcomePurged {
+		t.Errorf("outcome = %q, want purged", out)
+	}
+	if len(actor.stopped) != 0 {
+		t.Errorf("render stopped %v — a command called \"render\" must never touch a container",
+			actor.stopped)
+	}
+}
+
+// A revoked identity during the DAEMON's pass must still stop services: that is the whole point of
+// the fault, and the test above must not be read as licence to skip it everywhere.
+func TestOnce_TheDaemonStillStopsOnRevocation(t *testing.T) {
+	r, fs, actor, _ := setup(t, manifestBody)
+	fs.FailWith = &store.Error{Fault: store.FaultIdentityRevoked, Op: "login", Status: 401}
+
+	if _, err := r.Once(context.Background(), Pass{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(actor.stopped) == 0 {
+		t.Error("a revocation in the daemon must stop the service; otherwise the disowned secret " +
+			"stays in use in the running container")
+	}
+}
+
+// A wrong identity file must not be able to purge or stop anything. This is the bootstrap case: the
+// stack is running fine and somebody is installing anchor beside it.
+func TestOnce_ARejectedIdentityTouchesNothing(t *testing.T) {
+	r, fs, actor, alerter := setup(t, manifestBody)
+	// Give the stack a rendered file, as a running stack would have.
+	if _, err := r.Once(context.Background(), Pass{Force: true, NoAct: true}); err != nil {
+		t.Fatal(err)
+	}
+	fs.FailWith = &store.Error{Fault: store.FaultIdentityRejected, Op: "login", Status: 401}
+
+	out, err := r.Once(context.Background(), Pass{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out != OutcomeHeld {
+		t.Errorf("outcome = %q, want held", out)
+	}
+	if len(actor.stopped) != 0 {
+		t.Errorf("stopped %v for credentials that never worked", actor.stopped)
+	}
+	if _, statErr := os.Stat(r.Manifest.Destination); statErr != nil {
+		t.Error("the rendered file was purged because an identity file was wrong; a running stack " +
+			"would have lost its secrets over a typo")
+	}
+	if !alerter.sawSummary("identity file") {
+		t.Error("a rejected identity must be alerted, or a broken install is silent")
+	}
+}

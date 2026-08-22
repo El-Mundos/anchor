@@ -191,7 +191,7 @@ func (r *Reconciler) Once(ctx context.Context, p Pass) (Outcome, error) {
 	// 1. Cheap pre-check.
 	changedKeys, skip, err := r.moved(ctx, p.Force)
 	if err != nil {
-		return r.fault(ctx, err)
+		return r.fault(ctx, p, err)
 	}
 	if skip {
 		return OutcomeUnchanged, nil
@@ -200,7 +200,7 @@ func (r *Reconciler) Once(ctx context.Context, p Pass) (Outcome, error) {
 	// 2. Values, only now.
 	values, err := r.Store.Values(ctx, m.Keys())
 	if err != nil {
-		return r.fault(ctx, err)
+		return r.fault(ctx, p, err)
 	}
 
 	// 3. Render and compare bytes.
@@ -337,7 +337,7 @@ func (r *Reconciler) act(ctx context.Context, changedKeys []string) (Outcome, er
 }
 
 // fault turns a store failure into the one behaviour that is right for it.
-func (r *Reconciler) fault(ctx context.Context, err error) (Outcome, error) {
+func (r *Reconciler) fault(ctx context.Context, p Pass, err error) (Outcome, error) {
 	m := r.Manifest
 	stack := m.Stack()
 
@@ -355,7 +355,20 @@ func (r *Reconciler) fault(ctx context.Context, err error) (Outcome, error) {
 		return OutcomeRodeOut, nil
 
 	case store.FaultIdentityRevoked:
-		return r.revoked(ctx, se)
+		return r.revoked(ctx, p, se)
+
+	case store.FaultIdentityRejected:
+		// Credentials that have never worked. Almost always a wrong identity file rather than a
+		// revocation, so nothing is purged and nothing is stopped: an install with a typo in it must
+		// not be able to take down a stack that is currently running perfectly well.
+		r.Log.Error("identity refused and has never authenticated; treating as misconfiguration, "+
+			"NOT a revocation", "stack", stack, "err", se)
+		r.hold(ctx, heldIncomplete, Alert{Stack: stack, Severity: "critical",
+			Summary: "identity file is not accepted by the secret store",
+			Detail: fmt.Sprintf("%s. These credentials have never authenticated, so this is "+
+				"being read as a wrong identity file rather than a revocation: nothing has been "+
+				"purged and no service has been touched.", se)})
+		return OutcomeHeld, nil
 
 	case store.FaultSecretMissing:
 		// Our identity works and a declared key is not there. The last-good file stands: this is far
@@ -382,7 +395,7 @@ func (r *Reconciler) fault(ctx context.Context, err error) (Outcome, error) {
 // in removal, a hanging SIGTERM handler, a restart policy putting it straight back — and that is
 // precisely the case where silence would be worst. An alert conditional on the action succeeding is
 // an alert that is missing exactly when it matters.
-func (r *Reconciler) revoked(ctx context.Context, se *store.Error) (Outcome, error) {
+func (r *Reconciler) revoked(ctx context.Context, p Pass, se *store.Error) (Outcome, error) {
 	m := r.Manifest
 	stack := m.Stack()
 
@@ -397,6 +410,17 @@ func (r *Reconciler) revoked(ctx context.Context, se *store.Error) (Outcome, err
 		return OutcomeHeld, err
 	}
 	r.Log.Info("purge complete", "stack", stack, "file-removed", removed)
+
+	if p.NoAct {
+		// `anchor render` must not stop containers, on this path least of all. Reaching a revocation
+		// during a manual render is far more often an operator discovering a broken identity than a
+		// real disownment, and a command named "render" that stops production services is not a
+		// thing anyone should have to anticipate. The file is gone, which is the durable half of the
+		// response; stopping is the daemon's job.
+		r.Log.Warn("identity revoked, but this pass may not touch containers; "+
+			"services left running", "stack", stack)
+		return OutcomePurged, nil
+	}
 
 	var firstErr error
 	for _, sv := range m.Services {

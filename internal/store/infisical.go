@@ -75,6 +75,7 @@ type Client struct {
 	HTTP     *http.Client
 
 	mu      sync.Mutex
+	authed  bool // these credentials have logged in successfully at least once
 	token   string
 	expires time.Time
 
@@ -142,10 +143,23 @@ func (c *Client) login(ctx context.Context) (string, error) {
 	if resp.StatusCode != http.StatusOK {
 		// THIS is where a revocation is established. A 401 on a data request only means the token
 		// we were holding is no longer good, which is equally consistent with expiry; a 401 on a
-		// FRESH login means the credentials themselves were refused, and that only happens because
-		// somebody revoked them.
+		// FRESH login means the credentials themselves were refused.
+		fault := classify(resp.StatusCode, nil)
+
+		// ...but only call it a revocation if these credentials ever worked. On a first run, by far
+		// the likeliest reading of "invalid credentials" is that the identity file is wrong — and
+		// Infisical returns exactly this for a client id that is not a Universal Auth client id,
+		// which is a mistake anyone can make, since an identity's own id is also a UUID sitting one
+		// panel away. Calling that a revocation would purge and stop a healthy stack over a typo.
+		c.mu.Lock()
+		everWorked := c.authed
+		c.mu.Unlock()
+		if fault == FaultIdentityRevoked && !everWorked {
+			fault = FaultIdentityRejected
+		}
+
 		return "", &Error{
-			Fault:  classify(resp.StatusCode, nil),
+			Fault:  fault,
 			Op:     "login",
 			Status: resp.StatusCode,
 			Err:    fmt.Errorf("universal auth rejected the identity"),
@@ -165,6 +179,7 @@ func (c *Client) login(ctx context.Context) (string, error) {
 	}
 
 	c.mu.Lock()
+	c.authed = true // these credentials work; a later refusal is now a genuine revocation
 	c.token = out.AccessToken
 	ttl := time.Duration(out.ExpiresIn) * time.Second
 	if ttl > tokenSkew {

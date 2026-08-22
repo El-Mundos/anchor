@@ -97,14 +97,46 @@ func TestList_RetriesOnceWhenTheTokenExpiredRatherThanCallingItRevoked(t *testin
 
 // The other half: a 401 that survives a fresh login is a real revocation, and must be reported as
 // one. Retrying forever here would leave a revoked identity looking like a flaky network.
-func TestList_ReportsRevocationWhenAFreshLoginIsAlsoRefused(t *testing.T) {
+// The incident this prevents: a typo'd identity file purges a healthy stack's secrets and stops its
+// containers.
+//
+// Infisical answers "Invalid credentials" with a 401 both for a revoked identity and for a client id
+// that is simply wrong — and getting it wrong is easy, because an identity's own id is a UUID
+// sitting one panel away from the Universal Auth client id that is actually wanted. Since a
+// revocation is the one fault that deliberately takes a stack down, the two must not be conflated.
+//
+// The rule: you cannot be revoked from something you were never granted.
+func TestLogin_RefusalBeforeAnySuccessIsMisconfigurationNotRevocation(t *testing.T) {
+	c, _ := server(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized) // never accepted, not once
+	})
+	_, err := c.Versions(context.Background(), []string{"IONOS_API_PREFIX"})
+	var se *Error
+	if !asError(err, &se) {
+		t.Fatalf("want *store.Error, got %v", err)
+	}
+	if se.Fault != FaultIdentityRejected {
+		t.Errorf("fault = %v, want FaultIdentityRejected — credentials that never worked cannot "+
+			"have been revoked, and treating them as revoked purges a working stack", se.Fault)
+	}
+}
+
+// The genuine revocation: these credentials DID work, and then stopped being accepted. Somebody
+// disowned them, and taking the stack down is the intended outcome.
+func TestLogin_RefusalAfterASuccessIsARevocation(t *testing.T) {
+	accept := true
 	c, _ := server(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/auth/universal-auth/login" {
-			// First login succeeds so there is a cached token; afterwards the identity is gone.
+			if accept {
+				accept = false // works exactly once, then the identity is disowned
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"accessToken":"tok","expiresIn":3600}`))
+				return
+			}
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		w.WriteHeader(http.StatusUnauthorized)
+		w.WriteHeader(http.StatusUnauthorized) // the cached token is refused too
 	})
 	_, err := c.Versions(context.Background(), []string{"IONOS_API_PREFIX"})
 	var se *Error
