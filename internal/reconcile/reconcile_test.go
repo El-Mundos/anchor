@@ -1,0 +1,416 @@
+package reconcile
+
+import (
+	"context"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/El-Mundos/anchor/internal/manifest"
+	"github.com/El-Mundos/anchor/internal/store"
+)
+
+// fakeActor records what was done, so a test can assert that NOTHING was — which is the assertion
+// most of these cases actually care about.
+type fakeActor struct {
+	recreated, reloaded, stopped []string
+	stopErr                      error
+}
+
+func (f *fakeActor) Recreate(_ context.Context, _, s string) error {
+	f.recreated = append(f.recreated, s)
+	return nil
+}
+func (f *fakeActor) Reload(_ context.Context, _, s, _ string) error {
+	f.reloaded = append(f.reloaded, s)
+	return nil
+}
+func (f *fakeActor) Stop(_ context.Context, _, s string) error {
+	f.stopped = append(f.stopped, s)
+	return f.stopErr
+}
+
+type fakeAlerter struct{ alerts []Alert }
+
+func (f *fakeAlerter) Alert(_ context.Context, a Alert) error {
+	f.alerts = append(f.alerts, a)
+	return nil
+}
+
+func (f *fakeAlerter) sawSummary(substr string) bool {
+	for _, a := range f.alerts {
+		if len(substr) > 0 && contains(a.Summary, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+const manifestBody = `
+project: proj
+identity_file: /dev/null
+secrets:
+  - key: NS_SESSION_SECRET
+    as: SESSION_SECRET
+  - key: NS_POSTGRES_PASSWORD
+    as: POSTGRES_PASSWORD
+    shared_state: true
+services:
+  - name: api
+`
+
+func setup(t *testing.T, body string) (*Reconciler, *store.Fake, *fakeActor, *fakeAlerter) {
+	t.Helper()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "anchor.yml")
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m, err := manifest.Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := &store.Fake{
+		Values_: map[string]string{"NS_SESSION_SECRET": "s3cret", "NS_POSTGRES_PASSWORD": "pgpass"},
+		Metas: map[string]store.Meta{
+			"NS_SESSION_SECRET":    {Version: 1, UpdatedAt: time.Unix(1000, 0)},
+			"NS_POSTGRES_PASSWORD": {Version: 1, UpdatedAt: time.Unix(1000, 0)},
+		},
+	}
+	actor, alerter := &fakeActor{}, &fakeAlerter{}
+	return &Reconciler{
+		Manifest: m, Store: fs, Actor: actor, Alerter: alerter,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}, fs, actor, alerter
+}
+
+// The steady state is the common case, so it is the one that must not cost anything. If a poll
+// fetches values when nothing moved, anchor is shipping secrets across the network every minute
+// forever — invisible in behaviour, visible only in a packet capture.
+func TestOnce_SteadyStateDoesNotFetchValuesOrAct(t *testing.T) {
+	r, fs, actor, _ := setup(t, manifestBody)
+	if _, err := r.Once(context.Background(), Pass{Force: true, NoAct: true}); err != nil { // seed the file
+		t.Fatal(err)
+	}
+	before := fs.ValueCalls
+	actor.recreated = nil
+
+	out, err := r.Once(context.Background(), Pass{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != OutcomeUnchanged {
+		t.Errorf("outcome = %q, want unchanged", out)
+	}
+	if fs.ValueCalls != before {
+		t.Errorf("fetched values %d extra times in a steady state", fs.ValueCalls-before)
+	}
+	if len(actor.recreated) != 0 {
+		t.Errorf("recreated %v on an unchanged poll", actor.recreated)
+	}
+}
+
+// A purge, a wiped tmpfs or a first deploy all leave the store looking unchanged while the disk has
+// nothing on it. Trusting the pre-check here would leave a stack unable to start, with anchor
+// reporting that all is well.
+func TestOnce_RendersWhenTheFileIsMissingEvenIfNothingMoved(t *testing.T) {
+	r, _, _, _ := setup(t, manifestBody)
+	ctx := context.Background()
+	if _, err := r.Once(ctx, Pass{Force: true, NoAct: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(r.Manifest.Destination); err != nil {
+		t.Fatal(err)
+	}
+	out, err := r.Once(ctx, Pass{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out == OutcomeUnchanged {
+		t.Fatal("reported unchanged while the destination did not exist")
+	}
+	if _, err := os.Stat(r.Manifest.Destination); err != nil {
+		t.Fatalf("file was not restored: %v", err)
+	}
+}
+
+// Stale beats absent: an unreachable store must leave the last-good file alone and touch nothing.
+// The opposite behaviour puts Infisical on the boot path for every stack on the host.
+func TestOnce_RidesOutAnUnreachableStoreAndKeepsTheFile(t *testing.T) {
+	r, fs, actor, alerter := setup(t, manifestBody)
+	ctx := context.Background()
+	if _, err := r.Once(ctx, Pass{Force: true, NoAct: true}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(r.Manifest.Destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fs.FailWith = &store.Error{Fault: store.FaultTransient, Op: "versions"}
+	out, err := r.Once(ctx, Pass{})
+	if err != nil {
+		t.Fatalf("a transient failure must not surface as an error: %v", err)
+	}
+	if out != OutcomeRodeOut {
+		t.Errorf("outcome = %q, want rode-out", out)
+	}
+	after, err := os.ReadFile(r.Manifest.Destination)
+	if err != nil || string(after) != string(before) {
+		t.Error("the last-good file was disturbed by an outage")
+	}
+	if len(actor.stopped)+len(actor.recreated) != 0 {
+		t.Error("acted on a service during a store outage")
+	}
+	if len(alerter.alerts) != 0 {
+		t.Error("paged on a single failed poll; only PERSISTENT staleness deserves that")
+	}
+}
+
+// A revocation purges and stops — and the alert must go out FIRST, because the stop is the part
+// that can fail.
+func TestOnce_RevocationPurgesStopsAndAlerts(t *testing.T) {
+	r, fs, actor, alerter := setup(t, manifestBody)
+	ctx := context.Background()
+	if _, err := r.Once(ctx, Pass{Force: true, NoAct: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	fs.FailWith = &store.Error{Fault: store.FaultIdentityRevoked, Op: "versions"}
+	out, err := r.Once(ctx, Pass{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != OutcomePurged {
+		t.Errorf("outcome = %q, want purged", out)
+	}
+	if _, statErr := os.Stat(r.Manifest.Destination); !os.IsNotExist(statErr) {
+		t.Error("the rendered file survived a revocation")
+	}
+	if len(actor.stopped) != 1 || actor.stopped[0] != "api" {
+		t.Errorf("stopped %v, want [api]", actor.stopped)
+	}
+	if !alerter.sawSummary("revoked") {
+		t.Error("no alert mentioning the revocation")
+	}
+}
+
+// The case the ordering exists for: if the stop fails, the service is STILL RUNNING with revoked
+// secrets. An alert conditional on the stop succeeding would be missing exactly here.
+func TestOnce_AlertsEvenWhenTheStopFails(t *testing.T) {
+	r, fs, actor, alerter := setup(t, manifestBody)
+	ctx := context.Background()
+	if _, err := r.Once(ctx, Pass{Force: true, NoAct: true}); err != nil {
+		t.Fatal(err)
+	}
+	actor.stopErr = os.ErrPermission
+	fs.FailWith = &store.Error{Fault: store.FaultIdentityRevoked, Op: "versions"}
+
+	out, err := r.Once(ctx, Pass{})
+	if err == nil {
+		t.Error("a failed stop must be reported to the caller")
+	}
+	if out != OutcomePurged {
+		t.Errorf("outcome = %q, want purged", out)
+	}
+	if !alerter.sawSummary("revoked") || !alerter.sawSummary("could not stop") {
+		t.Errorf("expected both a revocation alert and a failed-stop alert, got %v", alerter.alerts)
+	}
+}
+
+// A service declared as surviving without its secrets keeps running; the file still goes.
+func TestOnce_RevocationLeavesDeclaredServicesRunning(t *testing.T) {
+	body := manifestBody + "    on_revoke: leave\n"
+	r, fs, actor, _ := setup(t, body)
+	ctx := context.Background()
+	if _, err := r.Once(ctx, Pass{Force: true, NoAct: true}); err != nil {
+		t.Fatal(err)
+	}
+	fs.FailWith = &store.Error{Fault: store.FaultIdentityRevoked, Op: "versions"}
+	if _, err := r.Once(ctx, Pass{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(actor.stopped) != 0 {
+		t.Errorf("stopped %v despite on_revoke: leave", actor.stopped)
+	}
+	if _, statErr := os.Stat(r.Manifest.Destination); !os.IsNotExist(statErr) {
+		t.Error("on_revoke: leave must still purge the file; it only spares the process")
+	}
+}
+
+// Rotating POSTGRES_PASSWORD in the store does not rotate it in Postgres, which only read it at
+// initdb. Recreating the app would point it at a password the database has never heard of: an
+// outage caused by a successful rotation.
+func TestOnce_SharedStateIsRenderedButNeverActedOn(t *testing.T) {
+	r, fs, actor, alerter := setup(t, manifestBody)
+	ctx := context.Background()
+	if _, err := r.Once(ctx, Pass{Force: true, NoAct: true}); err != nil {
+		t.Fatal(err)
+	}
+	actor.recreated = nil
+
+	fs.Metas["NS_POSTGRES_PASSWORD"] = store.Meta{Version: 2, UpdatedAt: time.Unix(2000, 0)}
+	fs.Values_["NS_POSTGRES_PASSWORD"] = "rotated"
+
+	out, err := r.Once(ctx, Pass{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actor.recreated) != 0 {
+		t.Fatalf("recreated %v for a shared-state rotation", actor.recreated)
+	}
+	if out != OutcomeHeld {
+		t.Errorf("outcome = %q, want held", out)
+	}
+	if !alerter.sawSummary("shared-state") {
+		t.Error("a shared-state change must be announced, not silently skipped")
+	}
+	// It must still be RENDERED — the file is the record of what the store holds.
+	b, err := os.ReadFile(r.Manifest.Destination)
+	if err != nil || !contains(string(b), "rotated") {
+		t.Error("the shared-state value was not written to the file")
+	}
+}
+
+// A shared-state secret rotating alongside an ordinary one must not freeze the ordinary one: the
+// rule exists to prevent an outage, not to stop the stack getting its new session secret.
+func TestOnce_MixedChangeStillActs(t *testing.T) {
+	r, fs, actor, _ := setup(t, manifestBody)
+	ctx := context.Background()
+	if _, err := r.Once(ctx, Pass{Force: true, NoAct: true}); err != nil {
+		t.Fatal(err)
+	}
+	actor.recreated = nil
+
+	fs.Metas["NS_POSTGRES_PASSWORD"] = store.Meta{Version: 2, UpdatedAt: time.Unix(2000, 0)}
+	fs.Metas["NS_SESSION_SECRET"] = store.Meta{Version: 2, UpdatedAt: time.Unix(2000, 0)}
+	fs.Values_["NS_SESSION_SECRET"] = "new-session"
+
+	out, err := r.Once(ctx, Pass{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != OutcomeActed || len(actor.recreated) != 1 {
+		t.Errorf("outcome = %q, recreated = %v; want the ordinary secret applied", out, actor.recreated)
+	}
+}
+
+// A version can be republished without the value changing. Acting on that would bounce a healthy
+// container for nothing — which is why the hash, not the version, authorises an action.
+func TestOnce_AVersionBumpWithIdenticalContentDoesNotAct(t *testing.T) {
+	r, fs, actor, _ := setup(t, manifestBody)
+	ctx := context.Background()
+	if _, err := r.Once(ctx, Pass{Force: true, NoAct: true}); err != nil {
+		t.Fatal(err)
+	}
+	actor.recreated = nil
+
+	fs.Metas["NS_SESSION_SECRET"] = store.Meta{Version: 9, UpdatedAt: time.Unix(9000, 0)}
+	// values deliberately unchanged
+
+	out, err := r.Once(ctx, Pass{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != OutcomeUnchanged {
+		t.Errorf("outcome = %q, want unchanged", out)
+	}
+	if len(actor.recreated) != 0 {
+		t.Errorf("recreated %v for a republished but identical secret", actor.recreated)
+	}
+}
+
+// All-or-nothing: a partial fetch must leave the previous file exactly as it was. Writing three of
+// four secrets produces a file that looks complete and is not.
+func TestOnce_IncompleteFetchLeavesThePreviousFileIntact(t *testing.T) {
+	r, fs, actor, alerter := setup(t, manifestBody)
+	ctx := context.Background()
+	if _, err := r.Once(ctx, Pass{Force: true, NoAct: true}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(r.Manifest.Destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fs.Metas["NS_SESSION_SECRET"] = store.Meta{Version: 2, UpdatedAt: time.Unix(2000, 0)}
+	delete(fs.Values_, "NS_SESSION_SECRET") // the store answers, but incompletely
+
+	out, err := r.Once(ctx, Pass{})
+	if err == nil {
+		t.Error("an incomplete set must be reported")
+	}
+	if out != OutcomeHeld {
+		t.Errorf("outcome = %q, want held", out)
+	}
+	after, err := os.ReadFile(r.Manifest.Destination)
+	if err != nil || string(after) != string(before) {
+		t.Error("an incomplete fetch overwrote a good file")
+	}
+	if len(actor.recreated) != 0 {
+		t.Error("acted on an incomplete render")
+	}
+	if !alerter.sawSummary("incomplete") {
+		t.Error("no alert for an incomplete secret set")
+	}
+}
+
+// A missing key is not a revocation: it is far more often a rename or a typo'd path, and destroying
+// a working stack over a misspelling is not a trade anyone would choose.
+func TestOnce_MissingKeyHoldsRatherThanPurging(t *testing.T) {
+	r, fs, actor, alerter := setup(t, manifestBody)
+	ctx := context.Background()
+	if _, err := r.Once(ctx, Pass{Force: true, NoAct: true}); err != nil {
+		t.Fatal(err)
+	}
+	fs.FailWith = &store.Error{Fault: store.FaultSecretMissing, Op: "versions"}
+
+	out, err := r.Once(ctx, Pass{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != OutcomeHeld {
+		t.Errorf("outcome = %q, want held", out)
+	}
+	if _, statErr := os.Stat(r.Manifest.Destination); statErr != nil {
+		t.Error("a missing key purged the file; only a revocation may do that")
+	}
+	if len(actor.stopped) != 0 {
+		t.Error("a missing key stopped a service; only a revocation may do that")
+	}
+	if !alerter.sawSummary("missing") {
+		t.Error("a missing declared secret must alert")
+	}
+}
+
+// The rendered file must use the manifest's names, not the store's. Getting this wrong produces a
+// file whose keys the compose file does not recognise — and, with :? guards, a stack that will not
+// start.
+func TestOnce_RendersUnderTheRenamedKeys(t *testing.T) {
+	r, _, _, _ := setup(t, manifestBody)
+	if _, err := r.Once(context.Background(), Pass{Force: true, NoAct: true}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(r.Manifest.Destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(string(b), "SESSION_SECRET=s3cret") {
+		t.Errorf("rendered file lacks the renamed key:\n%s", b)
+	}
+	if contains(string(b), "NS_SESSION_SECRET") {
+		t.Errorf("rendered file leaked the store's namespaced key:\n%s", b)
+	}
+}
