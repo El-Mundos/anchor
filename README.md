@@ -109,6 +109,7 @@ deploy/
   config.example.yml    host-wide settings -> /etc/anchor/config.yml
   anchor.example.yml    a worked stack manifest -> <root>/<stack>/anchor.yml
   install.sh            ./install.sh <stack> [stack-root], run as root on the host
+  anchor-watchdog.*     timer + script that notices anchor itself being down
   local/                your filled-in copies. NOT tracked.
 ```
 
@@ -141,19 +142,51 @@ That gives you two values, which go in a JSON file at the `identity_file` path f
 It must be `0600 root:root`. anchor refuses to start if either field is empty, rather than
 discovering it at the first poll.
 
+### Watching the watcher
+
+anchor runs `Restart=always` with no start limit, so it restarts forever and never enters systemd's
+failed state. That is deliberate: anchor is not a boot dependency for anything, and a transient
+problem should not permanently stop every stack getting its rotations. The cost is that a
+crash-looping anchor is invisible — systemd is content, the unit reports active, and nothing says
+rotations stopped an hour ago.
+
+Letting it fail instead would trade a silent failure for a louder but worse one, since systemd would
+stop retrying. So `anchor-watchdog.timer` runs every five minutes and alerts if anchor is not active
+or has restarted repeatedly since the last check. It has to be a separate process for the same
+reason a heartbeat needs a receiver: anchor cannot report that anchor is down.
+
+## Alerting
+
+anchor posts to Alertmanager, which Karma renders with no further integration.
+
+Worth knowing if you are reading the alerting code: Alertmanager has no concept of an alert that is
+"firing". It stores each alert with a start and an end and shows the ones whose window covers now,
+and an alert posted without `endsAt` is given `endsAt = now + resolve_timeout` — five minutes by
+default. That default suits Prometheus, which re-evaluates rules every few seconds and so renews the
+lease for free. anchor does not: re-deriving a condition costs an API round trip, so it sets `endsAt`
+explicitly and picks a lease per condition.
+
+Conditions anchor re-checks every poll get a short lease, so a fix clears quickly. Conditions only a
+human can clear — shared state that moved, a service on `on_change: none` — are remembered and
+re-sent every 30 minutes against a one hour lease, because the version pre-check means no later poll
+would ever mention them again. Nothing is ever explicitly resolved: a resolve that got lost would
+leave a stale alert forever.
+
 ## Status
 
 Working end to end, not yet deployed. Manifest, rendering, the Infisical client (with API version
 negotiation and a version pre-check that keeps values off the wire in the steady state), the
-reconcile loop, `on_change` actions and Alertmanager alerting are implemented and tested.
+reconcile loop, `on_change` actions, Alertmanager alerting and the watchdog are implemented and
+tested.
 
 Two known gaps:
 
-**Recreates do not yet route through Belay.** The design calls for it, so a rotation inherits Belay's
-health gate and rollback. Belay currently exposes no machine API for a health-gated recreate — its
-endpoints are form handlers behind SSO, and they update images rather than recreating in place with
-new configuration. anchor recreates directly meanwhile, and says so at startup rather than letting
-the difference pass unnoticed.
+**A recreate is not health-gated.** anchor recreates a container and reports whether compose exited
+cleanly — which says the container was created, not that the application inside it works. If a
+rotated secret is wrong, the container comes back broken and anchor does not know. Note that a
+rollback would not obviously help: the thing that changed is the rendered file, so recreating again
+just reapplies it. The useful version of this is anchor checking the container's health after its own
+recreate and holding, which does not require coupling anchor to anything else.
 
 **Reload is unverified per application.** It reports success once the signal is delivered, which is
 why it is opt-in and `recreate` is the default.

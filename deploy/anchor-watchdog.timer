@@ -1,0 +1,15 @@
+[Unit]
+Description=Run the anchor watchdog every 5 minutes
+Documentation=https://github.com/El-Mundos/anchor
+
+[Timer]
+# Soon after boot, because "anchor failed to start at boot" is one of the cases worth catching and
+# waiting a full interval to notice it would be the wrong way round.
+OnBootSec=2min
+OnUnitActiveSec=5min
+# Without this, a host that was asleep or off silently skips runs and the gap looks like health.
+Persistent=true
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

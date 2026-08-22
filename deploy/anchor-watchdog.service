@@ -1,0 +1,23 @@
+[Unit]
+Description=anchor watchdog — notice when anchor itself is down or crash-looping
+Documentation=https://github.com/El-Mundos/anchor
+# Deliberately NOT Requires=anchor.service or PartOf=. This unit exists precisely for the case where
+# anchor is not running, so tying its lifecycle to anchor's would silence it exactly when it matters.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/anchor-watchdog
+# Root because it reads /etc/anchor/config.yml (0644, but the unit stays root for symmetry with
+# anchor itself) and writes its restart counter under /run.
+User=root
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# The one path it writes: its own record of how many times anchor had restarted last time it looked.
+ReadWritePaths=/run
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true

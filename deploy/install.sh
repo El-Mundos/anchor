@@ -66,6 +66,13 @@ install -m 0644 "$CONFIG" /etc/anchor/config.yml
 install -m 0755 "$HERE/anchor" /usr/local/bin/anchor
 install -m 0644 -o root -g root "$MANIFEST" "$DIR/anchor.yml"
 
+# The watchdog is installed but not enabled, like everything else here. It is what notices anchor
+# itself being down or crash-looping — anchor cannot report its own absence, and the unit is
+# Restart=always precisely so it never enters a state systemd would complain about.
+install -m 0755 "$HERE/anchor-watchdog.sh" /usr/local/bin/anchor-watchdog
+install -m 0644 "$HERE/anchor-watchdog.service" /etc/systemd/system/
+install -m 0644 "$HERE/anchor-watchdog.timer" /etc/systemd/system/
+
 echo "== validating manifests (touches nothing) =="
 /usr/local/bin/anchor check
 
@@ -92,4 +99,6 @@ $STACK can now start from disk without Infisical being up. Next, when you want i
   3. Install the daemon, for automatic rotation:
        install -m 0644 $HERE/anchor.service /etc/systemd/system/
        systemctl daemon-reload && systemctl enable --now anchor
+  4. Enable the watchdog, so a dead or crash-looping anchor is not silent:
+       systemctl enable --now anchor-watchdog.timer
 MSG
