@@ -110,11 +110,12 @@ func runRender(ctx context.Context, cfg *config.Config, log *slog.Logger, only s
 		log.Error("startup", "err", err)
 		return 1
 	}
-	failed := 0
+	failed, matched := 0, 0
 	for _, r := range stacks {
 		if only != "" && r.Manifest.Stack() != only {
 			continue
 		}
+		matched++
 		outcome, err := r.Once(ctx, reconcile.Pass{Force: true, NoAct: true})
 		if err != nil {
 			log.Error("render failed", "stack", r.Manifest.Stack(), "outcome", outcome, "err", err)
@@ -122,6 +123,17 @@ func runRender(ctx context.Context, cfg *config.Config, log *slog.Logger, only s
 			continue
 		}
 		log.Info("render", "stack", r.Manifest.Stack(), "outcome", outcome)
+	}
+	if matched == 0 {
+		// A named stack that matched nothing. Previously this exited 0, so a typo in the install
+		// script — or in a hand-typed recovery command — reported success while rendering nothing
+		// at all, which on this path means the stack still cannot start.
+		names := make([]string, 0, len(stacks))
+		for _, r := range stacks {
+			names = append(names, r.Manifest.Stack())
+		}
+		log.Error("no such stack", "requested", only, "known", names)
+		return 1
 	}
 	if failed > 0 {
 		return 1
@@ -143,6 +155,17 @@ func runDaemon(ctx context.Context, cfg *config.Config, log *slog.Logger) int {
 	// PERSISTS is the thing worth waking someone for, and only the daemon can tell them apart.
 	staleSince := map[string]time.Time{}
 	const staleAfter = 30 * time.Minute
+
+	// Held conditions are re-sent on a slow cadence. Alertmanager has no notion of an alert being
+	// "firing" — it stores a start and an end and shows what covers now — so an alert that stops
+	// being re-sent is an alert that silently resolves. A held condition is one anchor knows is
+	// still true and cannot re-derive, so nothing but a repeat will keep it visible.
+	//
+	// Every heldRepeat, not every poll: the message is remembered rather than re-derived, so
+	// repeating it costs nothing but noise, and reconcile.DefaultHeldLease is long enough that a
+	// missed repeat does not make the condition vanish.
+	heldSent := map[string]time.Time{}
+	const heldRepeat = 30 * time.Minute
 
 	ticker := time.NewTicker(cfg.PollInterval)
 	defer ticker.Stop()
@@ -173,6 +196,25 @@ func runDaemon(ctx context.Context, cfg *config.Config, log *slog.Logger) int {
 				continue
 			}
 			delete(staleSince, stack)
+
+			// Re-send whatever this stack is still held on. Note this runs regardless of THIS
+			// pass's outcome: the steady state for a held stack is "unchanged", because from the
+			// store's side there is nothing left to notice.
+			if held := r.Held(); len(held) > 0 {
+				last, tracked := heldSent[stack]
+				switch {
+				case !tracked:
+					// The pass that created the hold alerted as it happened. Only start the clock.
+					heldSent[stack] = time.Now()
+				case time.Since(last) >= heldRepeat:
+					for _, a := range held {
+						r.Alerter.Alert(ctx, a) //nolint:errcheck // best-effort by design
+					}
+					heldSent[stack] = time.Now()
+				}
+			} else {
+				delete(heldSent, stack)
+			}
 		}
 
 		select {

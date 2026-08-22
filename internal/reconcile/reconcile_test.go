@@ -414,3 +414,133 @@ func TestOnce_RendersUnderTheRenamedKeys(t *testing.T) {
 		t.Errorf("rendered file leaked the store's namespaced key:\n%s", b)
 	}
 }
+
+// The incident this prevents: a stack sits for a week running secrets anchor refused to apply, and
+// Karma is empty the whole time.
+//
+// Alertmanager has no "firing" flag — it stores a window and shows what covers now — so an alert
+// that stops being re-sent silently resolves. Every held condition here alerts exactly once, and
+// the version pre-check then short-circuits every later pass to "unchanged", so nothing ever
+// re-sends it. The alert has to be REMEMBERED, because it cannot be re-derived.
+func TestOnce_HeldConditionsAreRememberedForResending(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("shared state", func(t *testing.T) {
+		r, fs, _, _ := setup(t, manifestBody)
+		if _, err := r.Once(ctx, Pass{Force: true, NoAct: true}); err != nil {
+			t.Fatal(err)
+		}
+		fs.Metas["NS_POSTGRES_PASSWORD"] = store.Meta{Version: 2, UpdatedAt: time.Unix(2000, 0)}
+		fs.Values_["NS_POSTGRES_PASSWORD"] = "rotated"
+		if _, err := r.Once(ctx, Pass{}); err != nil {
+			t.Fatal(err)
+		}
+		if len(r.Held()) != 1 {
+			t.Fatalf("Held() = %v, want the shared-state condition", r.Held())
+		}
+
+		// The pass that matters: from the store's side everything is now in sync, so this returns
+		// "unchanged" — and the condition must survive that, because it is still true.
+		out, err := r.Once(ctx, Pass{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != OutcomeUnchanged {
+			t.Fatalf("outcome = %q, want unchanged (the setup for this test is wrong)", out)
+		}
+		if len(r.Held()) != 1 {
+			t.Error("the shared-state condition was forgotten on the next quiet poll; " +
+				"Alertmanager would expire the alert while the database password is still unapplied")
+		}
+	})
+
+	t.Run("incomplete set", func(t *testing.T) {
+		r, fs, _, _ := setup(t, manifestBody)
+		fs.Values_["NS_SESSION_SECRET"] = "" // empty is missing: it is what a blank interpolation writes
+		if _, err := r.Once(ctx, Pass{Force: true, NoAct: true}); err == nil {
+			t.Fatal("expected an incomplete-set error")
+		}
+		if len(r.Held()) != 1 {
+			t.Fatalf("Held() = %v, want the incomplete condition", r.Held())
+		}
+	})
+
+	t.Run("held alerts outlive the repeat interval", func(t *testing.T) {
+		r, fs, _, _ := setup(t, manifestBody)
+		if _, err := r.Once(ctx, Pass{Force: true, NoAct: true}); err != nil {
+			t.Fatal(err)
+		}
+		fs.Metas["NS_POSTGRES_PASSWORD"] = store.Meta{Version: 2, UpdatedAt: time.Unix(2000, 0)}
+		fs.Values_["NS_POSTGRES_PASSWORD"] = "rotated"
+		if _, err := r.Once(ctx, Pass{}); err != nil {
+			t.Fatal(err)
+		}
+		// A lease shorter than the daemon's repeat interval would leave a window in which a
+		// still-true condition is invisible — the exact bug, reintroduced by a constant.
+		for _, a := range r.Held() {
+			if a.Lease < 30*time.Minute {
+				t.Errorf("held alert %q has a %s lease, shorter than the daemon's repeat interval",
+					a.Summary, a.Lease)
+			}
+		}
+	})
+}
+
+// Releasing must be per-condition. An ordinary secret rotating is not evidence that the database
+// password was ever applied, and clearing the lot would retract a warning that is still true.
+func TestOnce_AnOrdinarySuccessDoesNotClearASharedStateHold(t *testing.T) {
+	r, fs, _, _ := setup(t, manifestBody)
+	ctx := context.Background()
+	if _, err := r.Once(ctx, Pass{Force: true, NoAct: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	fs.Metas["NS_POSTGRES_PASSWORD"] = store.Meta{Version: 2, UpdatedAt: time.Unix(2000, 0)}
+	fs.Values_["NS_POSTGRES_PASSWORD"] = "rotated"
+	if _, err := r.Once(ctx, Pass{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Held()) != 1 {
+		t.Fatalf("Held() = %v, want the shared-state condition", r.Held())
+	}
+
+	// Now an ordinary secret rotates and is applied successfully.
+	fs.Metas["NS_SESSION_SECRET"] = store.Meta{Version: 2, UpdatedAt: time.Unix(3000, 0)}
+	fs.Values_["NS_SESSION_SECRET"] = "new-session"
+	out, err := r.Once(ctx, Pass{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != OutcomeActed {
+		t.Fatalf("outcome = %q, want acted", out)
+	}
+	if len(r.Held()) != 1 {
+		t.Error("a successful unrelated rotation cleared the shared-state hold; the database " +
+			"password is still unapplied and the only record of that is now gone")
+	}
+}
+
+// The one hold anchor can prove is over: a render that gets all the way through.
+func TestOnce_ASuccessfulRenderReleasesTheIncompleteHold(t *testing.T) {
+	r, fs, _, _ := setup(t, manifestBody)
+	ctx := context.Background()
+
+	fs.Values_["NS_SESSION_SECRET"] = ""
+	if _, err := r.Once(ctx, Pass{Force: true, NoAct: true}); err == nil {
+		t.Fatal("expected an incomplete-set error")
+	}
+	if len(r.Held()) != 1 {
+		t.Fatalf("Held() = %v, want the incomplete condition", r.Held())
+	}
+
+	// Somebody fills the secret in. The version moves, so an ordinary poll notices.
+	fs.Values_["NS_SESSION_SECRET"] = "filled-in"
+	fs.Metas["NS_SESSION_SECRET"] = store.Meta{Version: 2, UpdatedAt: time.Unix(2000, 0)}
+	if _, err := r.Once(ctx, Pass{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Held()) != 0 {
+		t.Errorf("Held() = %v after a successful render; a fixed problem must clear itself",
+			r.Held())
+	}
+}

@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sort"
+	"time"
 
 	"github.com/El-Mundos/anchor/internal/manifest"
 	"github.com/El-Mundos/anchor/internal/render"
@@ -69,6 +71,13 @@ type Alert struct {
 	Summary  string
 	Detail   string
 	Severity string // "warning" | "critical"
+
+	// Lease is how long this alert should stay visible without being re-sent. Zero means the
+	// delivery default. It belongs on the alert rather than the alerter because it is a property of
+	// the CONDITION: one anchor re-checks every poll should expire quickly so a fix shows up
+	// quickly, while one that persists until somebody does maintenance must outlive the gap
+	// between re-sends or it will look resolved when it is not.
+	Lease time.Duration
 }
 
 // Reconciler keeps one stack in step with the store.
@@ -79,11 +88,84 @@ type Reconciler struct {
 	Alerter  Alerter
 	Log      *slog.Logger
 
+	// HeldLease is how long a held alert stays visible without being re-sent. The daemon re-sends
+	// well inside it. Zero means DefaultHeldLease.
+	HeldLease time.Duration
+
 	// lastVersions is the pre-check baseline. In-memory only: on restart anchor re-fetches once,
 	// which is cheap and correct, whereas persisting it would mean trusting a cache across a
 	// process that may have died halfway through writing a file.
 	lastVersions map[string]store.Meta
+
+	// held are the conditions anchor has deliberately declined to resolve, keyed by reason.
+	//
+	// This exists because the version pre-check severs the path back to the alert. A stack whose
+	// secrets are incomplete, or whose shared state moved, alerts once — and on the next pass the
+	// versions match the baseline, the pass short-circuits to "unchanged", and the alert is never
+	// sent again. Five minutes later Alertmanager expires it and the stack is left running secrets
+	// anchor has explicitly refused to apply, with no trace anywhere.
+	//
+	// So these alerts are remembered rather than re-derived, and the daemon re-sends them.
+	held map[reason]Alert
 }
+
+// reason identifies a held condition, so that resolving one does not silently clear another.
+type reason string
+
+const (
+	// heldIncomplete: the store answered but the set was not renderable. anchor CAN observe this
+	// clearing — a later pass that renders successfully proves it — so it is released.
+	heldIncomplete reason = "incomplete"
+	// heldSharedState: shared state moved and was not applied. anchor can NEVER observe this
+	// clearing. The store considers the key current, so every later poll reports no change; the
+	// condition ends when a human performs the coordinated rotation, which is invisible from here.
+	heldSharedState reason = "shared-state"
+	// heldDrift: a service declares on_change: none, so the file is ahead of the process. Also
+	// invisible to anchor, since it never recreates that service and so never learns it caught up.
+	heldDrift reason = "drift"
+)
+
+// DefaultHeldLease is how long a held alert survives without renewal. Comfortably longer than the
+// interval at which the daemon re-sends, so failing to deliver one re-send does not make the
+// condition disappear.
+const DefaultHeldLease = time.Hour
+
+// Held returns every condition this stack is currently held on.
+//
+// Exported so the daemon can re-send them. The Reconciler cannot do that itself: it only knows
+// about a single pass, and "how often to repeat myself" is a question about time between passes.
+func (r *Reconciler) Held() []Alert {
+	out := make([]Alert, 0, len(r.held))
+	for _, a := range r.held {
+		out = append(out, a)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Summary < out[j].Summary })
+	return out
+}
+
+// hold records a condition that will not clear on its own, and alerts about it now.
+func (r *Reconciler) hold(ctx context.Context, why reason, a Alert) {
+	if a.Lease == 0 {
+		a.Lease = r.HeldLease
+		if a.Lease == 0 {
+			a.Lease = DefaultHeldLease
+		}
+	}
+	if r.held == nil {
+		r.held = map[reason]Alert{}
+	}
+	r.held[why] = a
+	r.alert(ctx, a)
+}
+
+// release clears one held condition, by reason.
+//
+// Keyed rather than wholesale because the conditions are not equivalent. Clearing everything on a
+// successful render would let an ordinary secret rotation silently retract a shared-state warning
+// that is still true — the database password would still be unapplied, and the one record of that
+// would be gone. Only heldIncomplete is ever released this way; the other two persist until anchor
+// restarts, which is the operator's way of saying the maintenance is done.
+func (r *Reconciler) release(why reason) { delete(r.held, why) }
 
 // Pass configures a single reconciliation pass.
 type Pass struct {
@@ -126,7 +208,11 @@ func (r *Reconciler) Once(ctx context.Context, p Pass) (Outcome, error) {
 	if err != nil {
 		// Incomplete: all-or-nothing refuses, and the previous file stands. This is a hold rather
 		// than a failure precisely because the old file is still serving.
-		r.alert(ctx, Alert{Stack: stack, Severity: "critical",
+		//
+		// Held rather than merely alerted: the store is answering perfectly well, so the next poll
+		// sees unchanged versions and says nothing. Without a remembered alert, "your stack is
+		// running on secrets I refused to update" would be a single message that expired.
+		r.hold(ctx, heldIncomplete, Alert{Stack: stack, Severity: "critical",
 			Summary: "refused to render an incomplete secret set",
 			Detail:  err.Error()})
 		return OutcomeHeld, err
@@ -142,6 +228,8 @@ func (r *Reconciler) Once(ctx context.Context, p Pass) (Outcome, error) {
 		r.Log.Debug("versions moved but rendered content is identical", "stack", stack)
 		return OutcomeUnchanged, nil
 	}
+	// A render got all the way through, which is the one held condition anchor can prove is over.
+	r.release(heldIncomplete)
 	r.Log.Info("rendered", "stack", stack, "file", m.Destination, "hash", render.Hash(content)[:12])
 
 	if p.NoAct {
@@ -203,7 +291,11 @@ func (r *Reconciler) act(ctx context.Context, changedKeys []string) (Outcome, er
 		// database has never heard of: an outage caused by a successful rotation.
 		r.Log.Warn("shared-state secrets changed; rendered but NOT acted on",
 			"stack", stack, "keys", changedKeys)
-		r.alert(ctx, Alert{Stack: stack, Severity: "warning",
+		// Held indefinitely. Nothing anchor can see will ever clear this: the store now considers
+		// the key current, so every later poll reports no change at all. The condition ends when a
+		// human performs the coordinated rotation, and the way to tell anchor that is to restart
+		// it — which is also when it would re-read the world anyway.
+		r.hold(ctx, heldSharedState, Alert{Stack: stack, Severity: "warning",
 			Summary: "shared-state secret changed and was not applied",
 			Detail: fmt.Sprintf("%v changed in the store. The running system still uses the old "+
 				"value; rotating these requires a coordinated procedure per system.", changedKeys)})
@@ -219,9 +311,11 @@ func (r *Reconciler) act(ctx context.Context, changedKeys []string) (Outcome, er
 			// because invisible drift is how a stack ends up running secrets nobody can name.
 			r.Log.Warn("secrets changed but on_change is none; rendered file is ahead of the "+
 				"running process", "stack", stack, "service", sv.Name)
-			r.alert(ctx, Alert{Stack: stack, Severity: "warning",
+			r.hold(ctx, heldDrift, Alert{Stack: stack, Severity: "warning",
 				Summary: "rendered secrets are ahead of the running service",
-				Detail:  fmt.Sprintf("service %s has on_change: none", sv.Name)})
+				Detail: fmt.Sprintf("service %s has on_change: none, so the rendered file has "+
+					"moved ahead of the process. It will pick the new values up whenever "+
+					"something next recreates it.", sv.Name)})
 			continue
 		case manifest.ActionReload:
 			err = r.Actor.Reload(ctx, m.Dir, sv.Name, sv.Signal)

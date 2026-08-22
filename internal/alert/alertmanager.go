@@ -15,6 +15,15 @@ import (
 	"github.com/El-Mundos/anchor/internal/reconcile"
 )
 
+// DefaultLease is how long an alert stays visible when the caller does not say.
+//
+// Alertmanager stores alerts with a start and an end, and shows the ones whose window covers now —
+// there is no "firing" flag. An alert POSTed without endsAt gets endsAt = now + resolve_timeout,
+// which defaults to five minutes. That default is built for Prometheus, which re-evaluates its
+// rules every few seconds and so renews the lease constantly for free. anchor does not: re-deriving
+// a condition costs an API round trip. Setting endsAt explicitly buys a longer lease instead.
+const DefaultLease = 15 * time.Minute
+
 // Alertmanager posts to the v2 alerts endpoint.
 type Alertmanager struct {
 	URL  string // e.g. http://localhost:9093/api/v2/alerts
@@ -25,6 +34,7 @@ type amAlert struct {
 	Labels       map[string]string `json:"labels"`
 	Annotations  map[string]string `json:"annotations"`
 	StartsAt     time.Time         `json:"startsAt"`
+	EndsAt       time.Time         `json:"endsAt"`
 	GeneratorURL string            `json:"generatorURL,omitempty"`
 }
 
@@ -42,7 +52,12 @@ func (a *Alertmanager) Alert(ctx context.Context, in reconcile.Alert) error {
 	if severity == "" {
 		severity = "warning"
 	}
+	lease := in.Lease
+	if lease <= 0 {
+		lease = DefaultLease
+	}
 
+	now := time.Now()
 	body, err := json.Marshal([]amAlert{{
 		Labels: map[string]string{
 			"alertname": fmt.Sprintf("(anchor) %s", in.Stack),
@@ -57,7 +72,14 @@ func (a *Alertmanager) Alert(ctx context.Context, in reconcile.Alert) error {
 		// Alertmanager expires an alert that stops being re-sent, so a resolved problem clears
 		// itself once anchor stops reporting it. No explicit resolve is needed, and none is sent:
 		// an explicit resolve that got lost would leave a stale alert forever.
-		StartsAt: time.Now(),
+		//
+		// The lease is the other half of that bargain. Expiry-as-resolve is only correct if the
+		// alert outlives the interval at which the sender re-derives it — otherwise a condition
+		// that is still true goes quiet and looks resolved. Callers that re-derive cheaply want a
+		// short lease so a fixed problem clears promptly; callers reporting something only a human
+		// can clear want a long one.
+		StartsAt: now,
+		EndsAt:   now.Add(lease),
 	}})
 	if err != nil {
 		return err
