@@ -1,0 +1,34 @@
+[Unit]
+Description=anchor — keeps Compose stacks' secrets current from Infisical
+Documentation=https://github.com/El-Mundos/anchor
+# Wants, not Requires: anchor must survive Docker being down. Its whole point is that a stack can
+# boot from the last-good file when the things it depends on are unavailable.
+Wants=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/anchor run
+# Root because it reads 0600 identity files, writes 0600 rendered files into deploy-owned
+# directories, and drives the Docker socket.
+User=root
+
+Restart=always
+RestartSec=10s
+
+# anchor is not a boot dependency for anything. If it cannot start, stacks keep running on their
+# last-good files — so restart forever and stay quiet rather than escalating.
+StartLimitIntervalSec=0
+
+# Hardening. Deliberately NOT ProtectSystem=strict: anchor's entire job is writing into stack
+# directories under /srv, and a sandbox that forbids that would make it fail in a way that looks
+# like a store problem.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
