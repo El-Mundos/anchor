@@ -73,12 +73,44 @@ secrets:
 services:
   - name: traefik
     on_change: recreate  # none | reload (opt-in, needs signal) | recreate (default)
+    on_revoke: stop      # stop (default) | leave — what to do if the identity is revoked
 ```
+
+`on_revoke` is a separate question from `on_change` because a revoked secret is not a changed one:
+the right outcome may be an outage. A revocation purges the rendered file and, by default, stops the
+service — a running container keeps the environment it was created with, so until it stops, the
+secret you revoked is still in use. `leave` is for services that are genuinely useful without the
+secret. There is no `restart`: the file is already gone, so a restart either crash-loops against a
+guarded variable or comes back healthy with blank values.
 
 Per-stack identities are deliberate: a leaked identity should expose one stack's secrets, not the
 fleet's.
 
+## Commands
+
+```
+anchor check            validate every manifest and exit; touches nothing
+anchor render [stack]   render once, now, and exit — never touches containers
+anchor run              reconcile continuously
+```
+
+`render` exists because a fresh stack has no file and the `${VAR:?}` guards mean it cannot start
+without one. It deliberately does not act on containers: rendering a file is safe on a running host,
+and nobody should get a restart from a command called "render".
+
 ## Status
 
-Early. Manifest parsing and rendering are implemented and tested; the Infisical client, the
-reconcile loop, `on_change` actions and alerting are not yet written.
+Working end to end, not yet deployed. Manifest, rendering, the Infisical client (with API version
+negotiation and a version pre-check that keeps values off the wire in the steady state), the
+reconcile loop, `on_change` actions and Alertmanager alerting are implemented and tested.
+
+Two known gaps:
+
+**Recreates do not yet route through Belay.** The design calls for it, so a rotation inherits Belay's
+health gate and rollback. Belay currently exposes no machine API for a health-gated recreate — its
+endpoints are form handlers behind SSO, and they update images rather than recreating in place with
+new configuration. anchor recreates directly meanwhile, and says so at startup rather than letting
+the difference pass unnoticed.
+
+**Reload is unverified per application.** It reports success once the signal is delivered, which is
+why it is opt-in and `recreate` is the default.
