@@ -120,6 +120,9 @@ const (
 	// clearing. The store considers the key current, so every later poll reports no change; the
 	// condition ends when a human performs the coordinated rotation, which is invisible from here.
 	heldSharedState reason = "shared-state"
+	// heldForeign: the destination exists and anchor did not write it. Cleared only by an operator
+	// dealing with the file, which anchor cannot observe beyond the file itself changing.
+	heldForeign reason = "foreign-destination"
 	// heldDrift: a service declares on_change: none, so the file is ahead of the process. Also
 	// invisible to anchor, since it never recreates that service and so never learns it caught up.
 	heldDrift reason = "drift"
@@ -214,6 +217,21 @@ func (r *Reconciler) Once(ctx context.Context, p Pass) (Outcome, error) {
 		// running on secrets I refused to update" would be a single message that expired.
 		r.hold(ctx, heldIncomplete, Alert{Stack: stack, Severity: "critical",
 			Summary: "refused to render an incomplete secret set",
+			Detail:  err.Error()})
+		return OutcomeHeld, err
+	}
+
+	// Refuse to destroy a file anchor did not write, unless the manifest says to adopt it.
+	foreign, err := render.Foreign(m.Destination)
+	if err != nil {
+		return OutcomeHeld, err
+	}
+	if foreign && !m.Adopt {
+		err := fmt.Errorf("%s already exists and was not written by anchor; it may hold variables "+
+			"this manifest does not declare, which would be silently deleted. Check it, then either "+
+			"move it aside or set `adopt: true`", m.Destination)
+		r.hold(ctx, heldForeign, Alert{Stack: stack, Severity: "critical",
+			Summary: "refusing to overwrite a file anchor did not write",
 			Detail:  err.Error()})
 		return OutcomeHeld, err
 	}

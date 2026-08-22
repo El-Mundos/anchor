@@ -612,3 +612,51 @@ func TestOnce_ARejectedIdentityTouchesNothing(t *testing.T) {
 		t.Error("a rejected identity must be alerted, or a broken install is silent")
 	}
 }
+
+// The end-to-end version of the same incident: a stack with an existing .env must not be silently
+// flattened to only the declared keys.
+func TestOnce_RefusesToOverwriteAFileAnchorDidNotWrite(t *testing.T) {
+	r, _, actor, alerter := setup(t, manifestBody)
+	existing := "PORT=8080\nTZ=Europe/Madrid\nSESSION_SECRET=old\n"
+	if err := os.WriteFile(r.Manifest.Destination, []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := r.Once(context.Background(), Pass{Force: true, NoAct: true})
+	if err == nil {
+		t.Fatal("expected a refusal")
+	}
+	if out != OutcomeHeld {
+		t.Errorf("outcome = %q, want held", out)
+	}
+	b, readErr := os.ReadFile(r.Manifest.Destination)
+	if readErr != nil || string(b) != existing {
+		t.Errorf("the pre-existing file was modified; PORT and TZ would have been silently deleted "+
+			"and compose would interpolate them to empty strings.\ngot: %q", string(b))
+	}
+	if len(actor.recreated) != 0 {
+		t.Errorf("acted on services despite refusing to render: %v", actor.recreated)
+	}
+	if !alerter.sawSummary("did not write") {
+		t.Error("a refusal to adopt must be alerted, not just returned as an error")
+	}
+}
+
+// With adopt set, the operator has said they looked. anchor proceeds.
+func TestOnce_AdoptTakesOverAnExistingFile(t *testing.T) {
+	r, _, _, _ := setup(t, manifestBody+"adopt: true\n")
+	if err := os.WriteFile(r.Manifest.Destination, []byte("PORT=8080\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := r.Once(context.Background(), Pass{Force: true, NoAct: true})
+	if err != nil {
+		t.Fatalf("adopt: true must permit the render: %v", err)
+	}
+	if out != OutcomeRendered {
+		t.Errorf("outcome = %q, want rendered", out)
+	}
+	b, _ := os.ReadFile(r.Manifest.Destination)
+	if !contains(string(b), "SESSION_SECRET") {
+		t.Error("the file was not replaced with anchor's render")
+	}
+}

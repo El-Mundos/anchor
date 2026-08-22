@@ -115,10 +115,21 @@ type Manifest struct {
 	// identity should expose one stack's secrets, not the fleet's.
 	IdentityFile string `yaml:"identity_file"`
 
-	Render      Render    `yaml:"render"`
-	Destination string    `yaml:"destination"` // rendered file path
-	Secrets     []Secret  `yaml:"secrets"`
-	Services    []Service `yaml:"services"`
+	Render      Render `yaml:"render"`
+	Destination string `yaml:"destination"` // rendered file path
+
+	// Adopt permits anchor to overwrite a destination that already exists and was NOT written by
+	// anchor.
+	//
+	// Off by default, and the default is the whole point. A stack being migrated almost always has
+	// a .env already, and it commonly holds more than secrets — ports, hostnames, feature flags.
+	// Silently replacing it with only the declared keys deletes the rest, and compose turns the
+	// difference into empty strings rather than an error: the container starts healthy with a blank
+	// value in it, which is the incident anchor exists to prevent. Requiring this to be set forces
+	// someone to open the file first, which is exactly when the undeclared variables get noticed.
+	Adopt    bool      `yaml:"adopt"`
+	Secrets  []Secret  `yaml:"secrets"`
+	Services []Service `yaml:"services"`
 
 	// Dir is where this manifest was found; not part of the file.
 	Dir string `yaml:"-"`

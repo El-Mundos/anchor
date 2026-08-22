@@ -121,3 +121,48 @@ func TestWrite_AtomicAndOnlyWhenChanged(t *testing.T) {
 		}
 	}
 }
+
+// The incident this prevents: migrating a stack TO anchor destroys the config it already had.
+//
+// A stack being migrated almost always has a .env, and it usually holds more than secrets — ports,
+// hostnames, feature flags. anchor renders only what the manifest declares, so overwriting such a
+// file deletes the rest, and compose turns the missing variables into empty strings rather than an
+// error. That is the original incident, reproduced by the tool built to prevent it.
+func TestForeign_TellsAnchorsOwnFileFromSomebodyElses(t *testing.T) {
+	dir := t.TempDir()
+
+	missing := filepath.Join(dir, "absent.env")
+	if foreign, err := Foreign(missing); err != nil || foreign {
+		t.Errorf("Foreign(missing) = (%v, %v), want (false, nil) — a first render is not a conflict",
+			foreign, err)
+	}
+
+	ours := filepath.Join(dir, "ours.env")
+	content, err := Dotenv(map[string]string{"A": "1"}, []string{"A"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Write(ours, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if foreign, err := Foreign(ours); err != nil || foreign {
+		t.Errorf("Foreign(anchor's own file) = (%v, %v), want (false, nil)", foreign, err)
+	}
+
+	theirs := filepath.Join(dir, "theirs.env")
+	if err := os.WriteFile(theirs, []byte("PORT=8080\nTZ=Europe/Madrid\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if foreign, err := Foreign(theirs); err != nil || !foreign {
+		t.Errorf("Foreign(hand-written file) = (%v, %v), want (true, nil)", foreign, err)
+	}
+
+	// A file shorter than the header must not read past the end and must still count as foreign.
+	stub := filepath.Join(dir, "stub.env")
+	if err := os.WriteFile(stub, []byte("X=1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if foreign, err := Foreign(stub); err != nil || !foreign {
+		t.Errorf("Foreign(short file) = (%v, %v), want (true, nil)", foreign, err)
+	}
+}

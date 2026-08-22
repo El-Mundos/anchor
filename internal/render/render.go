@@ -15,6 +15,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -40,6 +41,11 @@ func (e *ErrIncomplete) Error() string {
 		") — the previous file has been left in place"
 }
 
+// Header marks a file as anchor's own. It is how anchor tells a file it wrote from one somebody
+// else did, which is the difference between replacing a rendered file and destroying a
+// hand-maintained one.
+const Header = "# rendered by anchor — do not edit; changes are overwritten\n"
+
 // Dotenv formats secrets as KEY=value lines, sorted so identical inputs always produce identical
 // bytes. Stable output is what makes a content hash meaningful: without it, every render would look
 // like a change and every poll would trigger a restart.
@@ -50,7 +56,7 @@ func Dotenv(values map[string]string, keys []string) ([]byte, error) {
 	ordered := append([]string(nil), keys...)
 	sort.Strings(ordered)
 	var b strings.Builder
-	b.WriteString("# rendered by anchor — do not edit; changes are overwritten\n")
+	b.WriteString(Header)
 	for _, k := range ordered {
 		b.WriteString(k)
 		b.WriteString("=")
@@ -126,6 +132,33 @@ func Purge(path string) (removed bool, err error) {
 		return false, fmt.Errorf("purge %s: %w", path, err)
 	}
 	return true, nil
+}
+
+// Foreign reports whether path exists and was NOT written by anchor.
+//
+// The case this exists for: a stack being migrated usually already HAS a .env, and it commonly
+// holds more than secrets — ports, hostnames, feature flags, a TZ. anchor renders only what the
+// manifest declares, so overwriting such a file silently deletes everything undeclared. Compose then
+// interpolates those to empty strings and the container starts perfectly healthy with a blank
+// value in it, which is the exact incident anchor was built to prevent. Reproducing it during a
+// migration TO anchor would be a poor joke.
+//
+// A missing file is not foreign — that is the normal first render.
+func Foreign(path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer f.Close()
+	buf := make([]byte, len(Header))
+	n, err := io.ReadFull(f, buf)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return false, err
+	}
+	return string(buf[:n]) != Header, nil
 }
 
 // Write atomically replaces path with content, owner-readable only. It reports whether the content

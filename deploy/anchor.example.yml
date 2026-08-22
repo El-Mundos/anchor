@@ -18,6 +18,11 @@ identity_file: /srv/infra/example/anchor-identity.json
 render: env
 destination: /srv/infra/example/.env
 
+# anchor refuses to overwrite a destination it did not write, because a stack being migrated usually
+# already has a .env holding more than secrets — and rendering only the declared keys would silently
+# delete the rest. Set this ONLY after opening that file and dealing with what is in it.
+# adopt: true
+
 secrets:
   # `as:` renames a key on the way to the file. A store is shared and a compose file is not, so
   # secrets are usually namespaced per stack while compose wants the bare name. Without this the two

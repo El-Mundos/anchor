@@ -76,6 +76,20 @@ services:
     on_revoke: stop      # stop (default) | leave — what to do if the identity is revoked
 ```
 
+### Migrating a stack that already has a `.env`
+
+anchor refuses to overwrite a destination it did not write. Almost every stack being migrated
+already has a `.env`, and it usually holds more than secrets — ports, hostnames, feature flags, a
+timezone. anchor renders only what the manifest declares, so replacing such a file would delete
+everything undeclared, and compose turns the missing variables into empty strings rather than an
+error: the container starts healthy with a blank value in it. That is the incident anchor exists to
+prevent, and reproducing it during a migration *to* anchor would be a poor joke.
+
+So the first render against an existing file fails, loudly, naming the file. Open it, move any
+non-secret variables into the compose file or declare them, then either move the old file aside or
+set `adopt: true` in the manifest. The point of the flag is not permission, it is that somebody
+looked.
+
 `on_revoke` is a separate question from `on_change` because a revoked secret is not a changed one:
 the right outcome may be an outage. A revocation purges the rendered file and, by default, stops the
 service — a running container keeps the environment it was created with, so until it stops, the
