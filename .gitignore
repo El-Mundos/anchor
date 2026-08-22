@@ -1,3 +1,6 @@
-anchor
+# Anchored to the root on purpose. A bare "anchor" pattern matches any file OR DIRECTORY of that
+# name at any depth — which silently excluded cmd/anchor/, and with it the entire CLI.
+/anchor
+/deploy/anchor
 *.tmp
 .anchor-*
