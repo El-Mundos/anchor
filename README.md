@@ -178,6 +178,50 @@ stop retrying. So `anchor-watchdog.timer` runs every five minutes and alerts if 
 or has restarted repeatedly since the last check. It has to be a separate process for the same
 reason a heartbeat needs a receiver: anchor cannot report that anchor is down.
 
+## Adding a new stack
+
+anchor removes one class of failure completely: a stack can no longer start with blank or partially
+rendered secrets. It does not remove every class. The list below is the difference between the two,
+in the order it bites.
+
+1. **Guard every interpolated variable in the compose file.** `${FOO}` becomes an empty string when
+   `FOO` is missing — compose treats that as success. `${FOO:?...}` aborts instead. anchor guarantees
+   it will never *write* a partial file, but it cannot help before the first render, or after a
+   revocation deliberately removes the keys. Without the guard those cases are silent, and silence is
+   the whole problem. This is the single most important item here.
+2. **Give the stack its own Infisical identity**, and use the **Universal Auth Client ID** from the
+   Universal Auth panel — not the identity's own ID, which is also a UUID and sits one panel away.
+   Getting this wrong produces `401 Invalid credentials`, indistinguishable from a revocation on the
+   wire. anchor treats a refusal before any successful login as a misconfiguration rather than a
+   revocation for exactly this reason, so it will not act — but it will not work either.
+3. **Put the stack one level under a configured root**: `<stack_root>/<name>/anchor.yml`, beside its
+   compose file. Discovery does not recurse, on purpose.
+4. **Mark shared state.** Any secret that is a *copy* of state living in another system — a database
+   password the database only reads at initialisation — needs `shared_state: true`. anchor renders
+   these and refuses to act on them, because applying one would point the app at a credential the
+   other system has never heard of. Rotating them stays a manual, coordinated procedure.
+5. **Run `anchor check`, then `anchor render <stack>`, then start the stack.** In that order. render
+   never touches containers, so the first start remains a deliberate act.
+6. **Decide `on_revoke` per service.** `stop` is the default and makes a revocation real. `leave` is
+   for services that are genuinely useful without the secret — an edge proxy whose DNS API key only
+   affects certificate *renewal* keeps serving traffic, and stopping it would be a worse outage than
+   the one being defended against.
+
+### What anchor still cannot tell you
+
+**A well-formed but wrong value looks exactly like a correct one.** anchor verifies that every
+declared secret is present and non-empty, never that it is *right*. Only the application using the
+credential can determine that, and applications that use a credential lazily — a signing key touched
+only at submission time, a DNS API key touched only at renewal — will look perfectly healthy for
+weeks. That is precisely the shape of the incident that caused anchor to exist.
+
+A health check does not close this gap; it widens the false assurance, since the process starts and
+serves happily. If it matters for a given stack, the check has to *exercise* the credential: an SMTP
+`AUTH` with no message, loading and decrypting a signing key without signing anything.
+
+**A rotation that breaks the application is not currently detected.** anchor reports that compose
+exited cleanly, which means the container was created, not that what is inside it works.
+
 ## Alerting
 
 anchor posts to Alertmanager, which Karma renders with no further integration.
