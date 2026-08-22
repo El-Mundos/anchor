@@ -8,8 +8,10 @@ package act
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
+	"syscall"
 	"time"
 )
 
@@ -47,6 +49,29 @@ func (d *Docker) run(ctx context.Context, dir string, args ...string) error {
 	cmd.Dir = dir
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
+
+	// The timeout above does not bound this call on its own, and the way it fails is quiet.
+	//
+	// CommandContext kills the `docker` process when the deadline passes — but docker compose
+	// spawns children, they inherit the write end of the output pipe, and Wait blocks until every
+	// holder of that pipe is gone. So the CLI dies on time, the call returns half a minute late,
+	// and the reconcile loop is wedged for every other stack on the host in exactly the situation
+	// the timeout was written to prevent. Measured: a 200ms deadline returned after 30s, with the
+	// error already reading "signal: killed".
+	//
+	// Setpgid puts the whole invocation in its own process group so Cancel can kill the children
+	// too, and WaitDelay is the backstop for anything that still has the pipe open after that.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		// Negative pid means the process group. ESRCH is fine: it only means the group is
+		// already gone, which is the outcome being asked for.
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil &&
+			!errors.Is(err, syscall.ESRCH) {
+			return err
+		}
+		return nil
+	}
+	cmd.WaitDelay = 5 * time.Second
 
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
