@@ -54,6 +54,26 @@ func TestDotenv_IsDeterministic(t *testing.T) {
 	}
 }
 
+func TestPurge_RemovesAndIsRepeatable(t *testing.T) {
+	// A purge runs on the revocation path, which is already an incident. It must not turn a second
+	// poll into a second, different failure just because the first one succeeded.
+	path := filepath.Join(t.TempDir(), "sub", ".env")
+	if _, err := Write(path, []byte("A=1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := Purge(path)
+	if err != nil || !removed {
+		t.Fatalf("Purge = (%v, %v), want (true, nil)", removed, err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("file still present after Purge: %v", err)
+	}
+	removed, err = Purge(path)
+	if err != nil || removed {
+		t.Fatalf("second Purge = (%v, %v), want (false, nil)", removed, err)
+	}
+}
+
 func TestQuote(t *testing.T) {
 	cases := map[string]string{
 		"simple":            "simple",

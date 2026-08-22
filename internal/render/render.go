@@ -102,6 +102,32 @@ func Hash(content []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// Purge removes a rendered file, and reports whether there was one to remove.
+//
+// This is the deliberate exception to "stale beats absent". Everywhere else, an unreachable store
+// means the last-good file stands and containers keep booting. Here the store has not gone quiet —
+// it has refused this stack's identity, which only happens because somebody revoked it, and the
+// point of revoking is that what it was reading should stop being used.
+//
+// So the stack loses its ability to start, and that is the intended outcome rather than a side
+// effect: a deliberate revocation SHOULD take the stack down rather than let it come back up with
+// secrets that have been disowned. Nothing here reaches a running container — it keeps the
+// environment it was created with until something recreates it.
+//
+// Only ever call this for a revoked identity. Calling it for an unreachable store would put the
+// secret store back on the boot path and hand every stack on the host to Infisical's uptime.
+func Purge(path string) (removed bool, err error) {
+	// Remove is atomic: a concurrent reader either opens the whole file or does not find it, and
+	// never sees an emptied one.
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil // already gone; a purge that repeats is not a failure
+		}
+		return false, fmt.Errorf("purge %s: %w", path, err)
+	}
+	return true, nil
+}
+
 // Write atomically replaces path with content, owner-readable only. It reports whether the content
 // actually changed, so an unchanged render never triggers a restart.
 func Write(path string, content []byte, mode os.FileMode) (changed bool, err error) {
