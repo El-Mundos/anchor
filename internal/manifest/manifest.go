@@ -29,6 +29,24 @@ const (
 	ActionRecreate Action = "recreate"
 )
 
+// Revoke is what to do to a running service when the store refuses this stack's identity.
+//
+// This is asked as a separate question from on_change on purpose. on_change is about a secret whose
+// VALUE moved; this is about a secret that has been disowned, where the correct outcome may well be
+// an outage.
+type Revoke string
+
+const (
+	// RevokeStop stops the service. The default, and the only choice that makes a revocation real:
+	// a running container keeps the environment it was created with, so until it stops, the secret
+	// you revoked is still in use.
+	RevokeStop Revoke = "stop"
+	// RevokeLeave leaves it running and alerts instead. For a service that is useful without the
+	// secret, where availability is worth more than promptness. Declared per service because only
+	// an operator knows which ones those are — it cannot be discovered at runtime.
+	RevokeLeave Revoke = "leave"
+)
+
 // Render is how the secrets reach the service.
 type Render string
 
@@ -43,8 +61,20 @@ const (
 
 // Secret is one key this stack needs.
 type Secret struct {
-	// Key is the name in the secret store, and the name written into the rendered file.
+	// Key is the name in the secret store.
 	Key string `yaml:"key"`
+
+	// As is the name to write into the rendered file, when it differs from Key.
+	//
+	// Needed because a store is shared and a compose file is not: secrets are commonly namespaced
+	// per stack (KALOS_COBRA_SESSION_SECRET) while the compose file wants the bare name
+	// (SESSION_SECRET). Without this the two would have to be kept identical, which means either
+	// renaming every secret in the store or editing every compose file — and the usual result is a
+	// hand-maintained translation step, which is exactly the deploy wrapper anchor exists to delete.
+	//
+	// Deliberately explicit rather than a stack-wide strip_prefix: a prefix rule is invisible at the
+	// point of use, and two keys can silently collapse onto one name.
+	As string `yaml:"as"`
 
 	// SharedState marks a secret that is NOT simply owned by the store: a copy of state living in
 	// another system, like a database password the database itself only reads at initialisation.
@@ -56,12 +86,22 @@ type Secret struct {
 	SharedState bool `yaml:"shared_state"`
 }
 
+// Name is what this secret is called in the rendered file.
+func (s Secret) Name() string {
+	if s.As != "" {
+		return s.As
+	}
+	return s.Key
+}
+
 // Service is one compose service and what a secret change should do to it.
 type Service struct {
 	Name   string `yaml:"name"`
 	Action Action `yaml:"on_change"`
 	// Signal is the signal name for ActionReload, e.g. "HUP".
 	Signal string `yaml:"signal"`
+	// Revoke is what happens to this service when the identity is revoked. Defaults to stop.
+	Revoke Revoke `yaml:"on_revoke"`
 }
 
 // Manifest is one stack's declaration.
@@ -140,6 +180,7 @@ func (m *Manifest) validate() error {
 		return fmt.Errorf("no secrets declared — a manifest that asks for nothing does nothing")
 	}
 	seen := map[string]bool{}
+	rendered := map[string]string{}
 	for _, s := range m.Secrets {
 		if s.Key == "" {
 			return fmt.Errorf("a secret has no key")
@@ -148,6 +189,16 @@ func (m *Manifest) validate() error {
 			return fmt.Errorf("secret %q declared twice", s.Key)
 		}
 		seen[s.Key] = true
+		// Two store keys rendering to one name would silently drop one of them: the map would keep
+		// whichever was written last, the file would look complete, and all-or-nothing would be
+		// satisfied. Exactly the shape of failure this project exists to refuse, so it is caught at
+		// load where it is a typo rather than at rotation where it is an outage.
+		name := s.Name()
+		if first, dup := rendered[name]; dup {
+			return fmt.Errorf("secrets %q and %q both render as %q — one would silently overwrite "+
+				"the other", first, s.Key, name)
+		}
+		rendered[name] = s.Key
 	}
 	for i := range m.Services {
 		sv := &m.Services[i]
@@ -168,6 +219,27 @@ func (m *Manifest) validate() error {
 			return fmt.Errorf("service %s: on_change: %q is not one of %q, %q, %q",
 				sv.Name, sv.Action, ActionNone, ActionReload, ActionRecreate)
 		}
+		switch sv.Revoke {
+		case "":
+			// Stop by default: a revocation that leaves the secret in use has not happened yet.
+			sv.Revoke = RevokeStop
+		case RevokeStop, RevokeLeave:
+		case "restart":
+			// Rejected explicitly rather than falling into the generic error, because it is the
+			// intuitive choice and it is a trap. A revocation has already purged the rendered file,
+			// so a restart either fails against a guarded variable — a crash-loop where a clean
+			// stop was available — or, unguarded, interpolates to empty and comes back HEALTHY with
+			// no credentials. That is the exact silent failure this project exists to prevent, and
+			// a revocation is the worst possible moment to reintroduce it. A service that genuinely
+			// works without the secret should say so with %q.
+			return fmt.Errorf("service %s: on_revoke: \"restart\" is not offered — the rendered file "+
+				"is already purged, so a restart either fails on a guarded variable or silently "+
+				"starts with blank secrets; use %q if this service works without them",
+				sv.Name, RevokeLeave)
+		default:
+			return fmt.Errorf("service %s: on_revoke: %q is not one of %q, %q",
+				sv.Name, sv.Revoke, RevokeStop, RevokeLeave)
+		}
 	}
 	if m.Render == RenderEnv {
 		for _, sv := range m.Services {
@@ -181,11 +253,41 @@ func (m *Manifest) validate() error {
 	return nil
 }
 
-// Keys returns the declared key names, in manifest order.
+// Stack is the stack's name, taken from its directory. Used in logs and alerts, where "kalos-cobra"
+// is what someone recognises at 3am and a full path is not.
+func (m *Manifest) Stack() string {
+	return filepath.Base(m.Dir)
+}
+
+// Keys returns the store key names, in manifest order. This is what to ask the store for.
 func (m *Manifest) Keys() []string {
 	out := make([]string, 0, len(m.Secrets))
 	for _, s := range m.Secrets {
 		out = append(out, s.Key)
+	}
+	return out
+}
+
+// Names returns the rendered names, in manifest order. This is what the file will contain.
+func (m *Manifest) Names() []string {
+	out := make([]string, 0, len(m.Secrets))
+	for _, s := range m.Secrets {
+		out = append(out, s.Name())
+	}
+	return out
+}
+
+// Rename maps fetched values from store keys to rendered names.
+//
+// A key the store did not return is left absent rather than written as empty, so the completeness
+// check downstream still sees it as missing. Translating a gap into an empty string here would
+// defeat the one rule everything else depends on.
+func (m *Manifest) Rename(values map[string]string) map[string]string {
+	out := make(map[string]string, len(values))
+	for _, s := range m.Secrets {
+		if v, ok := values[s.Key]; ok {
+			out[s.Name()] = v
+		}
 	}
 	return out
 }
