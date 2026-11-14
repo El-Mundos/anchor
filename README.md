@@ -257,3 +257,7 @@ recreate and holding, which does not require coupling anchor to anything else.
 
 **Reload is unverified per application.** It reports success once the signal is delivered, which is
 why it is opt-in and `recreate` is the default.
+
+## License
+
+[MIT](./LICENSE).
